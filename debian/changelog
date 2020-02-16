@@ -1,3 +1,12 @@
+gnome-settings-daemon (3.30.2-3+grm2u1) unstable; urgency=medium
+
+  [ HaeRyong Jeong ]
+  * [75ed86f7] [Bug:1967] Fixed screenshot in clipboard
+
+  [ Gooroom Autobuilder ]
+
+ -- Gooroom Autobuilder <jenkins@gooroom.kr>  Mon, 17 Feb 2020 08:52:10 +0900
+
 gnome-settings-daemon (3.30.2-3) unstable; urgency=medium
 
   * debian/rules: Set libdir to /usr/lib, this is needed for the gtk-modules
