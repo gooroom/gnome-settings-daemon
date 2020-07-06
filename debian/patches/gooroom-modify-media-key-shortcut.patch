@@ -1,0 +1,193 @@
+diff --git a/plugins/media-keys/gsd-media-keys-manager.c b/plugins/media-keys/gsd-media-keys-manager.c
+index c3822af..cdc1518 100644
+--- a/plugins/media-keys/gsd-media-keys-manager.c
++++ b/plugins/media-keys/gsd-media-keys-manager.c
+@@ -981,6 +981,15 @@ gnome_session_shutdown_cb (GObject *source_object,
+ static void
+ gnome_session_shutdown (GsdMediaKeysManager *manager)
+ {
++        char *program = NULL;
++
++        program = g_find_program_in_path ("gooroom-logout");
++        if (program) {
++                execute (manager, "gooroom-logout", GDK_CURRENT_TIME);
++                g_free (program);
++                return;
++        }
++
+         GDBusProxy *proxy;
+ 
+         proxy = G_DBUS_PROXY (gnome_settings_bus_get_session_proxy ());
+diff --git a/plugins/media-keys/gsd-screenshot-utils.c b/plugins/media-keys/gsd-screenshot-utils.c
+index 45f9109..a208b6b 100644
+--- a/plugins/media-keys/gsd-screenshot-utils.c
++++ b/plugins/media-keys/gsd-screenshot-utils.c
+@@ -32,6 +32,10 @@
+ 
+ #include "gsd-screenshot-utils.h"
+ 
++#define GNOME_KEYRING_DBUS_NAME "org.gnome.keyring"
++#define GNOME_KEYRING_DBUS_PATH "/org/gnome/keyring/daemon"
++#define GNOME_KEYRING_DBUS_INTERFACE "org.gnome.keyring.Daemon"
++
+ #define SHELL_SCREENSHOT_BUS_NAME "org.gnome.Shell"
+ #define SHELL_SCREENSHOT_BUS_PATH "/org/gnome/Shell/Screenshot"
+ #define SHELL_SCREENSHOT_BUS_IFACE "org.gnome.Shell.Screenshot"
+@@ -320,9 +324,157 @@ screenshot_check_name_ready (ScreenshotContext *ctx)
+   screenshot_take (ctx);
+ }
+ 
++static void
++set_launch_context_env (GAppLaunchContext *launch_context)
++{
++  GError *error = NULL;
++  GVariant *variant, *item;
++  GVariantIter *iter;
++  GDBusConnection *connection;
++
++  connection = g_bus_get_sync (G_BUS_TYPE_SESSION, NULL, &error);
++
++  if (connection == NULL) {
++    g_warning ("system bus not available: %s", error->message);
++    g_error_free (error);
++    return;
++  }
++
++  error = NULL;
++  variant = g_dbus_connection_call_sync (connection,
++                                         GNOME_KEYRING_DBUS_NAME,
++                                         GNOME_KEYRING_DBUS_PATH,
++                                         GNOME_KEYRING_DBUS_INTERFACE,
++                                         "GetEnvironment",
++                                         NULL,
++                                         NULL,
++                                         G_DBUS_CALL_FLAGS_NONE,
++                                         -1,
++                                         NULL,
++                                         &error);
++
++  if (variant == NULL) {
++    g_warning ("Failed to call GetEnvironment on keyring daemon: %s", error->message);
++    g_error_free (error);
++    return;
++  }
++
++  g_variant_get (variant, "(a{ss})", &iter);
++
++  while ((item = g_variant_iter_next_value (iter))) {
++    char *key;
++    char *value;
++
++    g_variant_get (item, "{ss}", &key, &value);
++
++    g_app_launch_context_setenv (launch_context, key, value);
++
++    g_variant_unref (item);
++    g_free (key);
++    g_free (value);
++  }
++
++  g_variant_iter_free (iter);
++  g_variant_unref (variant);
++
++  g_object_unref (connection);
++}
++
++static void
++launch_app (GAppInfo *app_info)
++{
++  GError *error = NULL;
++  GdkAppLaunchContext *launch_context;
++
++  /* setup the launch context so the startup notification is correct */
++  launch_context = gdk_display_get_app_launch_context (gdk_display_get_default ());
++  gdk_app_launch_context_set_timestamp (launch_context, GDK_CURRENT_TIME);
++  set_launch_context_env (G_APP_LAUNCH_CONTEXT (launch_context));
++
++  if (!g_app_info_launch (app_info, NULL, G_APP_LAUNCH_CONTEXT (launch_context), &error)) {
++    g_warning ("Could not launch '%s': %s",
++               g_app_info_get_commandline (app_info),
++               error->message);
++    g_error_free (error);
++  }
++
++  g_object_unref (launch_context);
++}
++
++static void
++execute (char *cmd)
++{
++  GAppInfo *app_info;
++  g_autofree gchar *escaped = NULL;
++  gchar *p;
++
++  /* Escape all % characters as g_app_info_create_from_commandline will
++   * try to interpret them otherwise. */
++  escaped = g_malloc (strlen (cmd) * 2 + 1);
++  p = escaped;
++  while (*cmd) {
++    *p = *cmd;
++    p++;
++    if (*cmd == '%') {
++      *p = '%';
++      p++;
++    }
++    cmd++;
++  }
++  *p = '\0';
++
++  app_info = g_app_info_create_from_commandline (escaped, NULL, G_APP_INFO_CREATE_NONE, NULL);
++  launch_app (app_info);
++  g_object_unref (app_info);
++}
++
+ void
+ gsd_screenshot_take (MediaKeyType key_type)
+ {
++  char *program = NULL;
++
++  program = g_find_program_in_path ("gnome-screenshot");
++  if (program)
++    {
++      const char *option;
++
++      switch (key_type)
++        {
++        case SCREENSHOT_KEY:
++          option = "-b";
++          break;
++        case SCREENSHOT_CLIP_KEY:
++          option = "-bc";
++          break;
++        case WINDOW_SCREENSHOT_KEY:
++          option = "-bw";
++          break;
++        case WINDOW_SCREENSHOT_CLIP_KEY:
++          option = "-bcw";
++          break;
++        case AREA_SCREENSHOT_KEY:
++          option = "-ab";
++          break;
++        case AREA_SCREENSHOT_CLIP_KEY:
++          option = "-abc";
++          break;
++        default:
++          option = NULL;
++          g_assert_not_reached ();
++          break;
++        }
++
++      if (option)
++        {
++          char *cmd = NULL;
++          cmd = g_strdup_printf ("%s %s", program, option);
++          execute (cmd);
++          g_free (cmd);
++        }
++      g_free (program);
++      return;
++    }
++
+   ScreenshotContext *ctx = g_slice_new0 (ScreenshotContext);
+ 
+   ctx->copy_to_clipboard = (key_type == SCREENSHOT_CLIP_KEY ||
