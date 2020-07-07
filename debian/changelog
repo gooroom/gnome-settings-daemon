@@ -1,3 +1,12 @@
+gnome-settings-daemon (3.30.2-3+grm2u3) unstable; urgency=medium
+
+  [ HaeRyong Jeong ]
+  * [96f237f8] Removed smeared feature in night shift
+
+  [ Gooroom Autobuilder ]
+
+ -- Gooroom Autobuilder <jenkins@gooroom.kr>  Tue, 07 Jul 2020 11:56:38 +0900
+
 gnome-settings-daemon (3.30.2-3+grm2u2) unstable; urgency=medium
 
   [ cjheo ]
