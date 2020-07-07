@@ -1,3 +1,13 @@
+gnome-settings-daemon (3.30.2-3+grm2u2) unstable; urgency=medium
+
+  [ cjheo ]
+  * [1a8dc675] Revert "[Bug:1967] Fixed screenshot in clipboard"
+  * [cbe0cf6c] (Recommit)[Bug: 2413] Modify media-key shortcut for Gooroom
+
+  [ Gooroom Autobuilder ]
+
+ -- Gooroom Autobuilder <jenkins@gooroom.kr>  Tue, 07 Jul 2020 11:35:48 +0900
+
 gnome-settings-daemon (3.30.2-3+grm2u1) unstable; urgency=medium
 
   [ HaeRyong Jeong ]
