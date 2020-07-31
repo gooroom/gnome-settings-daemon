@@ -1,3 +1,14 @@
+gnome-settings-daemon (3.30.2-3+grm2u4) unstable; urgency=medium
+
+  [ cjheo ]
+  * [a0414d31] DPMS를 끄거나 혹은 잠자기(suspend)모드 작동 시 
+               스크린세이버가 연관되어 있으면 스크린세이버의
+               실행 이후에 작동 되도록 수정
+
+  [ Gooroom Autobuilder ]
+
+ -- Gooroom Autobuilder <jenkins@gooroom.kr>  Fri, 31 Jul 2020 10:30:14 +0900
+
 gnome-settings-daemon (3.30.2-3+grm2u3) unstable; urgency=medium
 
   [ HaeRyong Jeong ]
