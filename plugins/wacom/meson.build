@@ -28,6 +28,10 @@ deps = plugins_deps + [
   pango_dep
 ]
 
+if enable_wacom
+  deps += libwacom_dep
+endif
+
 cflags += ['-DLIBEXECDIR="@0@"'.format(gsd_libexecdir)]
 
 executable(
@@ -47,20 +51,13 @@ if enable_gudev
     m_dep
   ]
 
-  programs = [
-    'gsd-wacom-led-helper',
+  executable(
     'gsd-wacom-oled-helper',
-  ]
-
-  foreach program: programs
-    executable(
-      program,
-      program + '.c',
-      include_directories: top_inc,
-      dependencies: deps,
-      install: true,
-      install_rpath: gsd_pkglibdir,
-      install_dir: gsd_libexecdir
-    )
-  endforeach
+    'gsd-wacom-oled-helper.c',
+    include_directories: top_inc,
+    dependencies: deps,
+    install: true,
+    install_rpath: gsd_pkglibdir,
+    install_dir: gsd_libexecdir
+  )
 endif

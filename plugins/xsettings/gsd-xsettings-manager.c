@@ -41,12 +41,11 @@
 #include "gsd-enums.h"
 #include "gsd-xsettings-manager.h"
 #include "gsd-xsettings-gtk.h"
+#include "gnome-settings-bus.h"
 #include "xsettings-manager.h"
 #include "fc-monitor.h"
 #include "gsd-remote-display-manager.h"
 #include "wm-button-layout-translation.h"
-
-#define GNOME_XSETTINGS_MANAGER_GET_PRIVATE(o) (G_TYPE_INSTANCE_GET_PRIVATE ((o), GNOME_TYPE_XSETTINGS_MANAGER, GnomeXSettingsManagerPrivate))
 
 #define MOUSE_SETTINGS_SCHEMA     "org.gnome.settings-daemon.peripherals.mouse"
 #define BACKGROUND_SETTINGS_SCHEMA "org.gnome.desktop.background"
@@ -82,11 +81,6 @@ static const gchar introspection_xml[] =
 "    <property name='EnableAnimations' type='b' access='read'/>"
 "  </interface>"
 "</node>";
-
-typedef enum _DisplayLayoutMode {
-        DISPLAY_LAYOUT_MODE_LOGICAL = 1,
-        DISPLAY_LAYOUT_MODE_PHYSICAL = 2
-} DisplayLayoutMode;
 
 /* As we cannot rely on the X server giving us good DPI information, and
  * that we don't want multi-monitor screens to have different DPIs (thus
@@ -243,9 +237,9 @@ typedef enum _DisplayLayoutMode {
 #define DPI_FALLBACK 96
 
 typedef struct _TranslationEntry TranslationEntry;
-typedef void (* TranslationFunc) (GnomeXSettingsManager *manager,
-                                  TranslationEntry      *trans,
-                                  GVariant              *value);
+typedef void (* TranslationFunc) (GsdXSettingsManager *manager,
+                                  TranslationEntry    *trans,
+                                  GVariant            *value);
 
 struct _TranslationEntry {
         const char     *gsettings_schema;
@@ -256,7 +250,7 @@ struct _TranslationEntry {
 };
 
 typedef struct _FixedEntry FixedEntry;
-typedef void (* FixedFunc) (GnomeXSettingsManager *manager,
+typedef void (* FixedFunc) (GsdXSettingsManager *manager,
                             FixedEntry            *fixed);
 typedef union {
         const char *str;
@@ -269,8 +263,10 @@ struct _FixedEntry {
         FixedEntryValue val;
 };
 
-struct GnomeXSettingsManagerPrivate
+struct _GsdXSettingsManager
 {
+        GObject            parent;
+
         guint              start_idle_id;
         XSettingsManager  *manager;
         GHashTable        *settings;
@@ -281,7 +277,8 @@ struct GnomeXSettingsManagerPrivate
 
         GsdXSettingsGtk   *gtk;
 
-        GsdRemoteDisplayManager *remote_display;
+        guint              introspect_properties_changed_id;
+        guint              shell_introspect_watch_id;
         gboolean           enable_animations;
 
         guint              display_config_watch_id;
@@ -303,13 +300,13 @@ enum {
         GSD_XSETTINGS_ERROR_INIT
 };
 
-static void     gnome_xsettings_manager_class_init  (GnomeXSettingsManagerClass *klass);
-static void     gnome_xsettings_manager_init        (GnomeXSettingsManager      *xsettings_manager);
-static void     gnome_xsettings_manager_finalize    (GObject                  *object);
+static void     gsd_xsettings_manager_class_init  (GsdXSettingsManagerClass *klass);
+static void     gsd_xsettings_manager_init        (GsdXSettingsManager      *xsettings_manager);
+static void     gsd_xsettings_manager_finalize    (GObject                  *object);
 
-static void     register_manager_dbus               (GnomeXSettingsManager *manager);
+static void     register_manager_dbus             (GsdXSettingsManager *manager);
 
-G_DEFINE_TYPE (GnomeXSettingsManager, gnome_xsettings_manager, G_TYPE_OBJECT)
+G_DEFINE_TYPE (GsdXSettingsManager, gsd_xsettings_manager, G_TYPE_OBJECT)
 
 static gpointer manager_object = NULL;
 
@@ -320,37 +317,37 @@ gsd_xsettings_error_quark (void)
 }
 
 static void
-translate_bool_int (GnomeXSettingsManager *manager,
-                    TranslationEntry      *trans,
-                    GVariant              *value)
+translate_bool_int (GsdXSettingsManager *manager,
+                    TranslationEntry    *trans,
+                    GVariant            *value)
 {
-        xsettings_manager_set_int (manager->priv->manager, trans->xsetting_name,
+        xsettings_manager_set_int (manager->manager, trans->xsetting_name,
                                    g_variant_get_boolean (value));
 }
 
 static void
-translate_int_int (GnomeXSettingsManager *manager,
-                   TranslationEntry      *trans,
-                   GVariant              *value)
+translate_int_int (GsdXSettingsManager *manager,
+                   TranslationEntry    *trans,
+                   GVariant            *value)
 {
-        xsettings_manager_set_int (manager->priv->manager, trans->xsetting_name,
+        xsettings_manager_set_int (manager->manager, trans->xsetting_name,
                                    g_variant_get_int32 (value));
 }
 
 static void
-translate_string_string (GnomeXSettingsManager *manager,
-                         TranslationEntry      *trans,
-                         GVariant              *value)
+translate_string_string (GsdXSettingsManager *manager,
+                         TranslationEntry    *trans,
+                         GVariant            *value)
 {
-        xsettings_manager_set_string (manager->priv->manager,
+        xsettings_manager_set_string (manager->manager,
                                       trans->xsetting_name,
                                       g_variant_get_string (value, NULL));
 }
 
 static void
-translate_button_layout (GnomeXSettingsManager *manager,
-                         TranslationEntry      *trans,
-                         GVariant              *value)
+translate_button_layout (GsdXSettingsManager *manager,
+                         TranslationEntry    *trans,
+                         GVariant            *value)
 {
         GSettings *classic_settings;
         GVariant *classic_value = NULL;
@@ -360,7 +357,7 @@ translate_button_layout (GnomeXSettingsManager *manager,
          *       swap out the usual schema for the "classic" one when
          *       running in classic mode
          */
-        classic_settings = g_hash_table_lookup (manager->priv->settings,
+        classic_settings = g_hash_table_lookup (manager->settings,
                                                 CLASSIC_WM_SETTINGS_SCHEMA);
         if (classic_settings) {
                 classic_value = g_settings_get_value (classic_settings, "button-layout");
@@ -371,7 +368,7 @@ translate_button_layout (GnomeXSettingsManager *manager,
 
         translate_wm_button_layout_to_gtk (layout);
 
-        xsettings_manager_set_string (manager->priv->manager,
+        xsettings_manager_set_string (manager->manager,
                                       trans->xsetting_name,
                                       layout);
 
@@ -381,22 +378,22 @@ translate_button_layout (GnomeXSettingsManager *manager,
 }
 
 static void
-fixed_false_int (GnomeXSettingsManager *manager,
-                 FixedEntry            *fixed)
+fixed_false_int (GsdXSettingsManager *manager,
+                 FixedEntry          *fixed)
 {
-        xsettings_manager_set_int (manager->priv->manager, fixed->xsetting_name, FALSE);
+        xsettings_manager_set_int (manager->manager, fixed->xsetting_name, FALSE);
 }
 
 static void
-fixed_true_int (GnomeXSettingsManager *manager,
-                FixedEntry            *fixed)
+fixed_true_int (GsdXSettingsManager *manager,
+                FixedEntry          *fixed)
 {
-        xsettings_manager_set_int (manager->priv->manager, fixed->xsetting_name, TRUE);
+        xsettings_manager_set_int (manager->manager, fixed->xsetting_name, TRUE);
 }
 
 static void
-fixed_bus_id (GnomeXSettingsManager *manager,
-              FixedEntry            *fixed)
+fixed_bus_id (GsdXSettingsManager *manager,
+              FixedEntry          *fixed)
 {
         const gchar *id;
         GDBusConnection *bus;
@@ -418,7 +415,7 @@ fixed_bus_id (GnomeXSettingsManager *manager,
         if (res) {
                 g_variant_get (res, "(&s)", &id);
 
-                xsettings_manager_set_string (manager->priv->manager, fixed->xsetting_name, id);
+                xsettings_manager_set_string (manager->manager, fixed->xsetting_name, id);
                 g_variant_unref (res);
         }
 
@@ -426,19 +423,19 @@ fixed_bus_id (GnomeXSettingsManager *manager,
 }
 
 static void
-fixed_string (GnomeXSettingsManager *manager,
-              FixedEntry            *fixed)
+fixed_string (GsdXSettingsManager *manager,
+              FixedEntry          *fixed)
 {
-        xsettings_manager_set_string (manager->priv->manager,
+        xsettings_manager_set_string (manager->manager,
                                       fixed->xsetting_name,
                                       fixed->val.str);
 }
 
 static void
-fixed_int (GnomeXSettingsManager *manager,
+fixed_int (GsdXSettingsManager *manager,
            FixedEntry            *fixed)
 {
-        xsettings_manager_set_int (manager->priv->manager,
+        xsettings_manager_set_int (manager->manager,
                                    fixed->xsetting_name,
                                    fixed->val.num);
 }
@@ -453,6 +450,7 @@ static FixedEntry fixed_entries [] = {
         { "Gtk/AutoMnemonics",       fixed_true_int },
         { "Gtk/DialogsUseHeader",    fixed_true_int },
         { "Gtk/SessionBusId",        fixed_bus_id },
+        { "Gtk/ShellShowsAppMenu",   fixed_false_int },
         { "Gtk/ColorPalette",        fixed_string,      { .str = DEFAULT_COLOR_PALETTE } },
         { "Net/FallbackIconTheme",   fixed_string,      { .str = "gnome" } },
         { "Gtk/ToolbarStyle",        fixed_string,      { .str =  "both-horiz" } },
@@ -482,6 +480,7 @@ static TranslationEntry translations [] = {
         { "org.gnome.desktop.interface", "icon-theme",             "Net/IconThemeName",       translate_string_string },
         { "org.gnome.desktop.interface", "cursor-theme",           "Gtk/CursorThemeName",     translate_string_string },
         { "org.gnome.desktop.interface", "gtk-enable-primary-paste", "Gtk/EnablePrimaryPaste", translate_bool_int },
+        { "org.gnome.desktop.interface", "overlay-scrolling",      "Gtk/OverlayScrolling",    translate_bool_int },
         /* cursor-size is handled via the Xft side as it needs the scaling factor */
 
         { "org.gnome.desktop.sound", "theme-name",                 "Net/SoundThemeName",            translate_string_string },
@@ -500,22 +499,22 @@ static TranslationEntry translations [] = {
 static gboolean
 notify_idle (gpointer data)
 {
-        GnomeXSettingsManager *manager = data;
+        GsdXSettingsManager *manager = data;
 
-        xsettings_manager_notify (manager->priv->manager);
+        xsettings_manager_notify (manager->manager);
 
-        manager->priv->notify_idle_id = 0;
+        manager->notify_idle_id = 0;
         return G_SOURCE_REMOVE;
 }
 
 static void
-queue_notify (GnomeXSettingsManager *manager)
+queue_notify (GsdXSettingsManager *manager)
 {
-        if (manager->priv->notify_idle_id != 0)
+        if (manager->notify_idle_id != 0)
                 return;
 
-        manager->priv->notify_idle_id = g_idle_add (notify_idle, manager);
-        g_source_set_name_by_id (manager->priv->notify_idle_id, "[gnome-settings-daemon] notify_idle");
+        manager->notify_idle_id = g_idle_add (notify_idle, manager);
+        g_source_set_name_by_id (manager->notify_idle_id, "[gnome-settings-daemon] notify_idle");
 }
 
 typedef enum {
@@ -525,8 +524,8 @@ typedef enum {
 } GtkSettingsMask;
 
 static void
-send_dbus_event (GnomeXSettingsManager *manager,
-                 GtkSettingsMask        mask)
+send_dbus_event (GsdXSettingsManager *manager,
+                 GtkSettingsMask      mask)
 {
         GVariantBuilder props_builder;
         GVariant *props_changed = NULL;
@@ -535,25 +534,25 @@ send_dbus_event (GnomeXSettingsManager *manager,
 
         if (mask & GTK_SETTINGS_FONTCONFIG_TIMESTAMP) {
                 g_variant_builder_add (&props_builder, "{sv}", "FontconfigTimestamp",
-                                       g_variant_new_int64 (manager->priv->fontconfig_timestamp));
+                                       g_variant_new_int64 (manager->fontconfig_timestamp));
         }
 
         if (mask & GTK_SETTINGS_MODULES) {
-                const char *modules = gsd_xsettings_gtk_get_modules (manager->priv->gtk);
+                const char *modules = gsd_xsettings_gtk_get_modules (manager->gtk);
                 g_variant_builder_add (&props_builder, "{sv}", "Modules",
                                        g_variant_new_string (modules ? modules : ""));
         }
 
         if (mask & GTK_SETTINGS_ENABLE_ANIMATIONS) {
                 g_variant_builder_add (&props_builder, "{sv}", "EnableAnimations",
-                                       g_variant_new_boolean (manager->priv->enable_animations));
+                                       g_variant_new_boolean (manager->enable_animations));
         }
 
         props_changed = g_variant_new ("(s@a{sv}@as)", GTK_SETTINGS_DBUS_NAME,
                                        g_variant_builder_end (&props_builder),
                                        g_variant_new_strv (NULL, 0));
 
-        g_dbus_connection_emit_signal (manager->priv->dbus_connection,
+        g_dbus_connection_emit_signal (manager->dbus_connection,
                                        NULL,
                                        GTK_SETTINGS_DBUS_PATH,
                                        "org.freedesktop.DBus.Properties",
@@ -562,13 +561,13 @@ send_dbus_event (GnomeXSettingsManager *manager,
 }
 
 static double
-get_dpi_from_gsettings (GnomeXSettingsManager *manager)
+get_dpi_from_gsettings (GsdXSettingsManager *manager)
 {
 	GSettings  *interface_settings;
         double      dpi;
         double      factor;
 
-	interface_settings = g_hash_table_lookup (manager->priv->settings, INTERFACE_SETTINGS_SCHEMA);
+	interface_settings = g_hash_table_lookup (manager->settings, INTERFACE_SETTINGS_SCHEMA);
         factor = g_settings_get_double (interface_settings, TEXT_SCALING_FACTOR_KEY);
 
 	dpi = DPI_FALLBACK;
@@ -577,33 +576,29 @@ get_dpi_from_gsettings (GnomeXSettingsManager *manager)
 }
 
 static gboolean
-is_layout_mode_logical (GVariantIter *properties)
+get_legacy_ui_scale (GVariantIter *properties,
+                     int          *scale)
 {
-        DisplayLayoutMode layout_mode = DISPLAY_LAYOUT_MODE_LOGICAL;
         const char *key;
         GVariant *value;
 
-        while (g_variant_iter_next (properties, "{&sv}", &key, &value)) {
-                DisplayLayoutMode layout_mode_value;
+        *scale = 0;
 
-                if (!g_str_equal (key, "layout-mode")) {
-                        g_variant_unref (value);
+        while (g_variant_iter_loop (properties, "{&sv}", &key, &value)) {
+                if (!g_str_equal (key, "legacy-ui-scaling-factor"))
                         continue;
-                }
 
-                layout_mode_value = g_variant_get_uint32 (value);
-                g_variant_unref (value);
-
-                if (layout_mode_value < DISPLAY_LAYOUT_MODE_LOGICAL ||
-                    layout_mode_value > DISPLAY_LAYOUT_MODE_PHYSICAL)
-                        g_warning ("Unknown layout mode %u", layout_mode_value);
-                else
-                        layout_mode = layout_mode_value;
-
+                *scale = g_variant_get_int32 (value);
                 break;
         }
 
-        return layout_mode == DISPLAY_LAYOUT_MODE_LOGICAL;
+        if (*scale < 1) {
+                g_warning ("Failed to get current UI legacy scaling factor");
+                *scale = 1;
+                return FALSE;
+        }
+
+        return TRUE;
 }
 
 #define MODE_FORMAT "(siiddada{sv})"
@@ -619,17 +614,15 @@ is_layout_mode_logical (GVariantIter *properties)
 #define CURRENT_STATE_FORMAT "(u" MONITORS_FORMAT LOGICAL_MONITORS_FORMAT "a{sv})"
 
 static int
-get_window_scale (GnomeXSettingsManager *manager)
+get_window_scale (GsdXSettingsManager *manager)
 {
-        GError *error = NULL;
-        GVariant *current_state;
-        GVariantIter *logical_monitors;
-        GVariant *logical_monitor_variant;
-        GVariantIter *properties;
+        g_autoptr(GError) error = NULL;
+        g_autoptr(GVariant) current_state = NULL;
+        g_autoptr(GVariantIter) properties = NULL;
         int scale = 1;
 
         current_state =
-                g_dbus_connection_call_sync (manager->priv->dbus_connection,
+                g_dbus_connection_call_sync (manager->dbus_connection,
                                              "org.gnome.Mutter.DisplayConfig",
                                              "/org/gnome/Mutter/DisplayConfig",
                                              "org.gnome.Mutter.DisplayConfig",
@@ -643,7 +636,6 @@ get_window_scale (GnomeXSettingsManager *manager)
         if (!current_state) {
                 g_warning ("Failed to get current display configuration state: %s",
                            error->message);
-                g_error_free (error);
                 return 1;
         }
 
@@ -651,37 +643,11 @@ get_window_scale (GnomeXSettingsManager *manager)
                        CURRENT_STATE_FORMAT,
                        NULL,
                        NULL,
-                       &logical_monitors,
+                       NULL,
                        &properties);
 
-        if (is_layout_mode_logical (properties))
-                goto out;
-
-        while (g_variant_iter_next (logical_monitors, "@"LOGICAL_MONITOR_FORMAT,
-                                    &logical_monitor_variant)) {
-                gboolean is_primary;
-                double logical_monitor_scale;
-
-                g_variant_get (logical_monitor_variant,
-                               LOGICAL_MONITOR_FORMAT,
-                               NULL, NULL,
-                               &logical_monitor_scale,
-                               NULL,
-                               &is_primary,
-                               NULL, NULL);
-
-                if (is_primary) {
-                        scale = (int) logical_monitor_scale;
-                        break;
-                }
-
-                g_variant_unref (logical_monitor_variant);
-        }
-
-out:
-        g_variant_unref (current_state);
-        g_variant_iter_free (properties);
-        g_variant_iter_free (logical_monitors);
+        if (!get_legacy_ui_scale (properties, &scale))
+                g_warning ("Failed to get current UI legacy scaling factor");
 
         return scale;
 }
@@ -696,12 +662,12 @@ typedef struct {
         char       *cursor_theme;
         const char *rgba;
         const char *hintstyle;
-} GnomeXftSettings;
+} GsdXftSettings;
 
 /* Read GSettings and determine the appropriate Xft settings based on them. */
 static void
-xft_settings_get (GnomeXSettingsManager *manager,
-                  GnomeXftSettings      *settings)
+xft_settings_get (GsdXSettingsManager *manager,
+                  GsdXftSettings    *settings)
 {
 	GSettings  *interface_settings;
         GsdFontAntialiasingMode antialiasing;
@@ -711,11 +677,11 @@ xft_settings_get (GnomeXSettingsManager *manager,
         double dpi;
         int cursor_size;
 
-	interface_settings = g_hash_table_lookup (manager->priv->settings, INTERFACE_SETTINGS_SCHEMA);
+	interface_settings = g_hash_table_lookup (manager->settings, INTERFACE_SETTINGS_SCHEMA);
 
-        antialiasing = g_settings_get_enum (manager->priv->plugin_settings, FONT_ANTIALIASING_KEY);
-        hinting = g_settings_get_enum (manager->priv->plugin_settings, FONT_HINTING_KEY);
-        order = g_settings_get_enum (manager->priv->plugin_settings, FONT_RGBA_ORDER_KEY);
+        antialiasing = g_settings_get_enum (manager->plugin_settings, FONT_ANTIALIASING_KEY);
+        hinting = g_settings_get_enum (manager->plugin_settings, FONT_HINTING_KEY);
+        order = g_settings_get_enum (manager->plugin_settings, FONT_RGBA_ORDER_KEY);
 
         settings->antialias = (antialiasing != GSD_FONT_ANTIALIASING_MODE_NONE);
         settings->hinting = (hinting != GSD_FONT_HINTING_NONE);
@@ -780,26 +746,26 @@ xft_settings_get (GnomeXSettingsManager *manager,
 }
 
 static void
-xft_settings_clear (GnomeXftSettings *settings)
+xft_settings_clear (GsdXftSettings *settings)
 {
         g_free (settings->cursor_theme);
 }
 
 static void
-xft_settings_set_xsettings (GnomeXSettingsManager *manager,
-                            GnomeXftSettings      *settings)
+xft_settings_set_xsettings (GsdXSettingsManager *manager,
+                            GsdXftSettings      *settings)
 {
         gnome_settings_profile_start (NULL);
 
-        xsettings_manager_set_int (manager->priv->manager, "Xft/Antialias", settings->antialias);
-        xsettings_manager_set_int (manager->priv->manager, "Xft/Hinting", settings->hinting);
-        xsettings_manager_set_string (manager->priv->manager, "Xft/HintStyle", settings->hintstyle);
-        xsettings_manager_set_int (manager->priv->manager, "Gdk/WindowScalingFactor", settings->window_scale);
-        xsettings_manager_set_int (manager->priv->manager, "Gdk/UnscaledDPI", settings->dpi);
-        xsettings_manager_set_int (manager->priv->manager, "Xft/DPI", settings->scaled_dpi);
-        xsettings_manager_set_string (manager->priv->manager, "Xft/RGBA", settings->rgba);
-        xsettings_manager_set_int (manager->priv->manager, "Gtk/CursorThemeSize", settings->cursor_size);
-        xsettings_manager_set_string (manager->priv->manager, "Gtk/CursorThemeName", settings->cursor_theme);
+        xsettings_manager_set_int (manager->manager, "Xft/Antialias", settings->antialias);
+        xsettings_manager_set_int (manager->manager, "Xft/Hinting", settings->hinting);
+        xsettings_manager_set_string (manager->manager, "Xft/HintStyle", settings->hintstyle);
+        xsettings_manager_set_int (manager->manager, "Gdk/WindowScalingFactor", settings->window_scale);
+        xsettings_manager_set_int (manager->manager, "Gdk/UnscaledDPI", settings->dpi);
+        xsettings_manager_set_int (manager->manager, "Xft/DPI", settings->scaled_dpi);
+        xsettings_manager_set_string (manager->manager, "Xft/RGBA", settings->rgba);
+        xsettings_manager_set_int (manager->manager, "Gtk/CursorThemeSize", settings->cursor_size);
+        xsettings_manager_set_string (manager->manager, "Gtk/CursorThemeName", settings->cursor_theme);
 
         gnome_settings_profile_end (NULL);
 }
@@ -836,7 +802,7 @@ update_property (GString *props, const gchar* key, const gchar* value)
 }
 
 static void
-xft_settings_set_xresources (GnomeXftSettings *settings)
+xft_settings_set_xresources (GsdXftSettings *settings)
 {
         GString    *add_string;
         char        dpibuf[G_ASCII_DTOSTR_BUF_SIZE];
@@ -851,8 +817,8 @@ xft_settings_set_xresources (GnomeXftSettings *settings)
 
         g_debug("xft_settings_set_xresources: orig res '%s'", add_string->str);
 
-        update_property (add_string, "Xft.dpi",
-                                g_ascii_dtostr (dpibuf, sizeof (dpibuf), (double) settings->scaled_dpi / 1024.0));
+        g_snprintf (dpibuf, sizeof (dpibuf), "%d", (int) (settings->scaled_dpi / 1024.0 + 0.5));
+        update_property (add_string, "Xft.dpi", dpibuf);
         update_property (add_string, "Xft.antialias",
                                 settings->antialias ? "1" : "0");
         update_property (add_string, "Xft.hinting",
@@ -882,9 +848,9 @@ xft_settings_set_xresources (GnomeXftSettings *settings)
  * X resources
  */
 static void
-update_xft_settings (GnomeXSettingsManager *manager)
+update_xft_settings (GsdXSettingsManager *manager)
 {
-        GnomeXftSettings settings;
+        GsdXftSettings settings;
 
         gnome_settings_profile_start (NULL);
 
@@ -897,33 +863,33 @@ update_xft_settings (GnomeXSettingsManager *manager)
 }
 
 static void
-xft_callback (GSettings             *settings,
-              const gchar           *key,
-              GnomeXSettingsManager *manager)
+xft_callback (GSettings           *settings,
+              const gchar         *key,
+              GsdXSettingsManager *manager)
 {
         update_xft_settings (manager);
         queue_notify (manager);
 }
 
 static void
-override_callback (GSettings             *settings,
-                   const gchar           *key,
-                   GnomeXSettingsManager *manager)
+override_callback (GSettings           *settings,
+                   const gchar         *key,
+                   GsdXSettingsManager *manager)
 {
         GVariant *value;
 
         value = g_settings_get_value (settings, XSETTINGS_OVERRIDE_KEY);
 
-        xsettings_manager_set_overrides (manager->priv->manager, value);
+        xsettings_manager_set_overrides (manager->manager, value);
         queue_notify (manager);
 
         g_variant_unref (value);
 }
 
 static void
-plugin_callback (GSettings             *settings,
-                 const char            *key,
-                 GnomeXSettingsManager *manager)
+plugin_callback (GSettings           *settings,
+                 const char          *key,
+                 GsdXSettingsManager *manager)
 {
         if (g_str_equal (key, GTK_MODULES_DISABLED_KEY) ||
             g_str_equal (key, GTK_MODULES_ENABLED_KEY)) {
@@ -936,17 +902,17 @@ plugin_callback (GSettings             *settings,
 }
 
 static void
-gtk_modules_callback (GsdXSettingsGtk       *gtk,
-                      GParamSpec            *spec,
-                      GnomeXSettingsManager *manager)
+gtk_modules_callback (GsdXSettingsGtk     *gtk,
+                      GParamSpec          *spec,
+                      GsdXSettingsManager *manager)
 {
-        const char *modules = gsd_xsettings_gtk_get_modules (manager->priv->gtk);
+        const char *modules = gsd_xsettings_gtk_get_modules (manager->gtk);
 
         if (modules == NULL) {
-                xsettings_manager_delete_setting (manager->priv->manager, "Gtk/Modules");
+                xsettings_manager_delete_setting (manager->manager, "Gtk/Modules");
         } else {
                 g_debug ("Setting GTK modules '%s'", modules);
-                xsettings_manager_set_string (manager->priv->manager,
+                xsettings_manager_set_string (manager->manager,
                                               "Gtk/Modules",
                                               modules);
         }
@@ -956,17 +922,17 @@ gtk_modules_callback (GsdXSettingsGtk       *gtk,
 }
 
 static void
-fontconfig_callback (FcMonitor              *monitor,
-                     GnomeXSettingsManager  *manager)
+fontconfig_callback (FcMonitor            *monitor,
+                     GsdXSettingsManager  *manager)
 {
         gint64 timestamp = g_get_real_time ();
         gint timestamp_sec = (int)(timestamp / G_TIME_SPAN_SECOND);
 
         gnome_settings_profile_start (NULL);
 
-        xsettings_manager_set_int (manager->priv->manager, "Fontconfig/Timestamp", timestamp_sec);
+        xsettings_manager_set_int (manager->manager, "Fontconfig/Timestamp", timestamp_sec);
 
-        manager->priv->fontconfig_timestamp = timestamp;
+        manager->fontconfig_timestamp = timestamp;
 
         queue_notify (manager);
         send_dbus_event (manager, GTK_SETTINGS_FONTCONFIG_TIMESTAMP);
@@ -974,67 +940,37 @@ fontconfig_callback (FcMonitor              *monitor,
 }
 
 static gboolean
-start_fontconfig_monitor_idle_cb (GnomeXSettingsManager *manager)
+start_fontconfig_monitor_idle_cb (GsdXSettingsManager *manager)
 {
         gnome_settings_profile_start (NULL);
 
-        fc_monitor_start (manager->priv->fontconfig_monitor);
+        fc_monitor_start (manager->fontconfig_monitor);
 
         gnome_settings_profile_end (NULL);
 
-        manager->priv->start_idle_id = 0;
+        manager->start_idle_id = 0;
 
         return FALSE;
 }
 
 static void
-start_fontconfig_monitor (GnomeXSettingsManager  *manager)
+start_fontconfig_monitor (GsdXSettingsManager  *manager)
 {
         gnome_settings_profile_start (NULL);
 
-        manager->priv->fontconfig_monitor = fc_monitor_new ();
-        g_signal_connect (manager->priv->fontconfig_monitor, "updated", G_CALLBACK (fontconfig_callback), manager);
+        manager->fontconfig_monitor = fc_monitor_new ();
+        g_signal_connect (manager->fontconfig_monitor, "updated", G_CALLBACK (fontconfig_callback), manager);
 
-        manager->priv->start_idle_id = g_idle_add ((GSourceFunc) start_fontconfig_monitor_idle_cb, manager);
-        g_source_set_name_by_id (manager->priv->start_idle_id, "[gnome-settings-daemon] start_fontconfig_monitor_idle_cb");
+        manager->start_idle_id = g_idle_add ((GSourceFunc) start_fontconfig_monitor_idle_cb, manager);
+        g_source_set_name_by_id (manager->start_idle_id, "[gnome-settings-daemon] start_fontconfig_monitor_idle_cb");
 
         gnome_settings_profile_end (NULL);
 }
 
 static void
-notify_have_shell (GnomeXSettingsManager   *manager,
-                   gboolean                 have_shell)
-{
-        gnome_settings_profile_start (NULL);
-        if (manager->priv->have_shell == have_shell)
-                return;
-        manager->priv->have_shell = have_shell;
-        xsettings_manager_set_int (manager->priv->manager, "Gtk/ShellShowsAppMenu", have_shell);
-        queue_notify (manager);
-        gnome_settings_profile_end (NULL);
-}
-
-static void
-on_shell_appeared (GDBusConnection *connection,
-                   const gchar     *name,
-                   const gchar     *name_owner,
-                   gpointer         user_data)
-{
-        notify_have_shell (user_data, TRUE);
-}
-
-static void
-on_shell_disappeared (GDBusConnection *connection,
-                      const gchar     *name,
-                      gpointer         user_data)
-{
-        notify_have_shell (user_data, FALSE);
-}
-
-static void
-process_value (GnomeXSettingsManager *manager,
-               TranslationEntry      *trans,
-               GVariant              *value)
+process_value (GsdXSettingsManager *manager,
+               TranslationEntry    *trans,
+               GVariant            *value)
 {
         (* trans->translate) (manager, trans, value);
 }
@@ -1066,9 +1002,9 @@ find_translation_entry (GSettings *settings, const char *key)
 }
 
 static void
-xsettings_callback (GSettings             *settings,
-                    const char            *key,
-                    GnomeXSettingsManager *manager)
+xsettings_callback (GSettings           *settings,
+                    const char          *key,
+                    GsdXSettingsManager *manager)
 {
         TranslationEntry *trans;
         GVariant         *value;
@@ -1109,7 +1045,7 @@ terminate_cb (void *data)
 }
 
 static gboolean
-setup_xsettings_managers (GnomeXSettingsManager *manager)
+setup_xsettings_managers (GsdXSettingsManager *manager)
 {
         GdkDisplay *display;
         gboolean    res;
@@ -1118,7 +1054,7 @@ setup_xsettings_managers (GnomeXSettingsManager *manager)
         display = gdk_display_get_default ();
 
         res = xsettings_manager_check_running (gdk_x11_display_get_xdisplay (display),
-                                               gdk_screen_get_number (gdk_screen_get_default ()));
+                                               gdk_x11_screen_get_screen_number (gdk_screen_get_default ()));
 
         if (res) {
                 g_warning ("You can only run one xsettings manager at a time; exiting");
@@ -1126,11 +1062,11 @@ setup_xsettings_managers (GnomeXSettingsManager *manager)
         }
 
         terminated = FALSE;
-        manager->priv->manager = xsettings_manager_new (gdk_x11_display_get_xdisplay (display),
-                                                        gdk_screen_get_number (gdk_screen_get_default ()),
-                                                        terminate_cb,
-                                                        &terminated);
-        if (! manager->priv->manager) {
+        manager->manager = xsettings_manager_new (gdk_x11_display_get_xdisplay (display),
+                                                  gdk_x11_screen_get_screen_number (gdk_screen_get_default ()),
+                                                  terminate_cb,
+                                                  &terminated);
+        if (! manager->manager) {
                 g_warning ("Could not create xsettings manager!");
                 return FALSE;
         }
@@ -1139,53 +1075,7 @@ setup_xsettings_managers (GnomeXSettingsManager *manager)
 }
 
 static void
-start_shell_monitor (GnomeXSettingsManager *manager)
-{
-        notify_have_shell (manager, TRUE);
-        manager->priv->have_shell = TRUE;
-        manager->priv->shell_name_watch_id = g_bus_watch_name (G_BUS_TYPE_SESSION,
-                                                               "org.gnome.Shell",
-                                                               0,
-                                                               on_shell_appeared,
-                                                               on_shell_disappeared,
-                                                               manager,
-                                                               NULL);
-}
-
-static void
-force_disable_animation_changed (GObject    *gobject,
-                                 GParamSpec *pspec,
-                                 GnomeXSettingsManager *manager)
-{
-        gboolean force_disable, value;
-
-        g_object_get (gobject, "force-disable-animations", &force_disable, NULL);
-        if (force_disable)
-                value = FALSE;
-        else {
-                GSettings *settings;
-
-                settings = g_hash_table_lookup (manager->priv->settings, "org.gnome.desktop.interface");
-                value = g_settings_get_boolean (settings, "enable-animations");
-        }
-
-        manager->priv->enable_animations = value;
-        xsettings_manager_set_int (manager->priv->manager, "Gtk/EnableAnimations", value);
-
-        queue_notify (manager);
-        send_dbus_event (manager, GTK_SETTINGS_ENABLE_ANIMATIONS);
-}
-
-static void
-enable_animations_changed_cb (GSettings             *settings,
-                              gchar                 *key,
-                              GnomeXSettingsManager *manager)
-{
-        force_disable_animation_changed (G_OBJECT (manager->priv->remote_display), NULL, manager);
-}
-
-static void
-monitors_changed (GnomeXSettingsManager *manager)
+monitors_changed (GsdXSettingsManager *manager)
 {
         update_xft_settings (manager);
         queue_notify (manager);
@@ -1200,7 +1090,7 @@ on_monitors_changed (GDBusConnection *connection,
                      GVariant        *parameters,
                      gpointer         data)
 {
-        GnomeXSettingsManager *manager = data;
+        GsdXSettingsManager *manager = data;
         monitors_changed (manager);
 }
 
@@ -1210,13 +1100,171 @@ on_display_config_name_appeared_handler (GDBusConnection *connection,
                                          const gchar     *name_owner,
                                          gpointer         data)
 {
-        GnomeXSettingsManager *manager = data;
+        GsdXSettingsManager *manager = data;
         monitors_changed (manager);
 }
 
+static void
+animations_enabled_changed (GsdXSettingsManager *manager)
+{
+        g_autoptr(GError) error = NULL;
+        g_autoptr(GVariant) res = NULL;
+        g_autoptr(GVariant) animations_enabled_variant = NULL;
+        gboolean animations_enabled;
+
+        res = g_dbus_connection_call_sync (manager->dbus_connection,
+                                           "org.gnome.Shell.Introspect",
+                                           "/org/gnome/Shell/Introspect",
+                                           "org.freedesktop.DBus.Properties",
+                                           "Get",
+                                           g_variant_new ("(ss)",
+                                                          "org.gnome.Shell.Introspect",
+                                                          "AnimationsEnabled"),
+                                           NULL,
+                                           G_DBUS_CALL_FLAGS_NONE,
+                                           -1,
+                                           NULL,
+                                           &error);
+        if (!res) {
+                g_warning ("Failed to get animations-enabled state: %s",
+                           error->message);
+                return;
+        }
+
+        g_variant_get (res, "(v)", &animations_enabled_variant);
+        g_variant_get (animations_enabled_variant, "b", &animations_enabled);
+
+        if (manager->enable_animations == animations_enabled)
+                return;
+
+        manager->enable_animations = animations_enabled;
+        xsettings_manager_set_int (manager->manager, "Gtk/EnableAnimations",
+                                   animations_enabled);
+        queue_notify (manager);
+        send_dbus_event (manager, GTK_SETTINGS_ENABLE_ANIMATIONS);
+}
+
+static void
+on_introspect_properties_changed (GDBusConnection *connection,
+                                  const gchar     *sender_name,
+                                  const gchar     *object_path,
+                                  const gchar     *interface_name,
+                                  const gchar     *signal_name,
+                                  GVariant        *parameters,
+                                  gpointer         data)
+{
+        GsdXSettingsManager *manager = data;
+        animations_enabled_changed (manager);
+}
+
+static void
+on_shell_introspect_name_appeared_handler (GDBusConnection *connection,
+                                           const gchar     *name,
+                                           const gchar     *name_owner,
+                                           gpointer         data)
+{
+        GsdXSettingsManager *manager = data;
+        animations_enabled_changed (manager);
+}
+
+static void
+launch_xwayland_services_on_dir (const gchar *path)
+{
+        GFileEnumerator *enumerator;
+        GError *error = NULL;
+        GList *l, *scripts = NULL;
+        GFile *dir;
+
+        g_debug ("launch_xwayland_services_on_dir: %s", path);
+
+        dir = g_file_new_for_path (path);
+        enumerator = g_file_enumerate_children (dir,
+                                                G_FILE_ATTRIBUTE_STANDARD_NAME ","
+                                                G_FILE_ATTRIBUTE_ACCESS_CAN_EXECUTE ","
+                                                G_FILE_ATTRIBUTE_STANDARD_TYPE,
+                                                G_FILE_QUERY_INFO_NONE,
+                                                NULL, &error);
+        g_object_unref (dir);
+
+        if (!enumerator) {
+                if (!g_error_matches (error,
+                                      G_IO_ERROR,
+                                      G_IO_ERROR_NOT_FOUND)) {
+                        g_warning ("Error opening '%s': %s",
+                                   path, error->message);
+                }
+
+                g_error_free (error);
+                return;
+        }
+
+        while (TRUE) {
+                GFileInfo *info;
+                GFile *child;
+
+                if (!g_file_enumerator_iterate (enumerator,
+                                                &info, &child,
+                                                NULL, &error)) {
+                        g_warning ("Error iterating on '%s': %s",
+                                   path, error->message);
+                        g_error_free (error);
+                        break;
+                }
+
+                if (!info)
+                        break;
+
+                if (g_file_info_get_file_type (info) != G_FILE_TYPE_REGULAR ||
+                    !g_file_info_get_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_EXECUTE))
+                        continue;
+
+                scripts = g_list_prepend (scripts, g_file_get_path (child));
+        }
+
+        scripts = g_list_sort (scripts, (GCompareFunc) strcmp);
+
+        for (l = scripts; l; l = l->next) {
+                gchar *args[2] = { l->data, NULL };
+
+                g_debug ("launch_xwayland_services_on_dir: Spawning '%s'", args[0]);
+                if (!g_spawn_sync (NULL, args, NULL,
+                                   G_SPAWN_DEFAULT,
+                                   NULL, NULL,
+                                   NULL, NULL, NULL,
+                                   &error)) {
+                        g_warning ("Error when spawning '%s': %s",
+                                   args[0], error->message);
+                        g_clear_error (&error);
+                }
+        }
+
+        g_object_unref (enumerator);
+        g_list_free_full (scripts, g_free);
+}
+
+static void
+launch_xwayland_services (void)
+{
+        const gchar * const * config_dirs;
+        gint i;
+
+        config_dirs = g_get_system_config_dirs ();
+
+        for (i = 0; config_dirs[i] != NULL; i++) {
+                gchar *config_dir;
+
+                config_dir = g_build_filename (config_dirs[i],
+                                               "Xwayland-session.d",
+                                               NULL);
+
+                launch_xwayland_services_on_dir (config_dir);
+                g_free (config_dir);
+        }
+}
+
 gboolean
-gnome_xsettings_manager_start (GnomeXSettingsManager *manager,
-                               GError               **error)
+gsd_xsettings_manager_start (GsdXSettingsManager *manager,
+                             GError             **error)
 {
         GVariant    *overrides;
         guint        i;
@@ -1233,12 +1281,8 @@ gnome_xsettings_manager_start (GnomeXSettingsManager *manager,
                 return FALSE;
         }
 
-        manager->priv->remote_display = gsd_remote_display_manager_new ();
-        g_signal_connect (G_OBJECT (manager->priv->remote_display), "notify::force-disable-animations",
-                          G_CALLBACK (force_disable_animation_changed), manager);
-
-        manager->priv->monitors_changed_id =
-                g_dbus_connection_signal_subscribe (manager->priv->dbus_connection,
+        manager->monitors_changed_id =
+                g_dbus_connection_signal_subscribe (manager->dbus_connection,
                                                     "org.gnome.Mutter.DisplayConfig",
                                                     "org.gnome.Mutter.DisplayConfig",
                                                     "MonitorsChanged",
@@ -1248,8 +1292,8 @@ gnome_xsettings_manager_start (GnomeXSettingsManager *manager,
                                                     on_monitors_changed,
                                                     manager,
                                                     NULL);
-        manager->priv->display_config_watch_id =
-                g_bus_watch_name_on_connection (manager->priv->dbus_connection,
+        manager->display_config_watch_id =
+                g_bus_watch_name_on_connection (manager->dbus_connection,
                                                 "org.gnome.Mutter.DisplayConfig",
                                                 G_BUS_NAME_WATCHER_FLAGS_NONE,
                                                 on_display_config_name_appeared_handler,
@@ -1257,22 +1301,42 @@ gnome_xsettings_manager_start (GnomeXSettingsManager *manager,
                                                 manager,
                                                 NULL);
 
-        manager->priv->settings = g_hash_table_new_full (g_str_hash, g_str_equal,
+        manager->introspect_properties_changed_id =
+                g_dbus_connection_signal_subscribe (manager->dbus_connection,
+                                                    "org.gnome.Shell.Introspect",
+                                                    "org.freedesktop.DBus.Properties",
+                                                    "PropertiesChanged",
+                                                    "/org/gnome/Shell/Introspect",
+                                                    NULL,
+                                                    G_DBUS_SIGNAL_FLAGS_NONE,
+                                                    on_introspect_properties_changed,
+                                                    manager,
+                                                    NULL);
+        manager->shell_introspect_watch_id =
+                g_bus_watch_name_on_connection (manager->dbus_connection,
+                                                "org.gnome.Shell.Introspect",
+                                                G_BUS_NAME_WATCHER_FLAGS_NONE,
+                                                on_shell_introspect_name_appeared_handler,
+                                                NULL,
+                                                manager,
+                                                NULL);
+
+        manager->settings = g_hash_table_new_full (g_str_hash, g_str_equal,
                                                          NULL, (GDestroyNotify) g_object_unref);
 
-        g_hash_table_insert (manager->priv->settings,
+        g_hash_table_insert (manager->settings,
                              MOUSE_SETTINGS_SCHEMA, g_settings_new (MOUSE_SETTINGS_SCHEMA));
-        g_hash_table_insert (manager->priv->settings,
+        g_hash_table_insert (manager->settings,
                              BACKGROUND_SETTINGS_SCHEMA, g_settings_new (BACKGROUND_SETTINGS_SCHEMA));
-        g_hash_table_insert (manager->priv->settings,
+        g_hash_table_insert (manager->settings,
                              INTERFACE_SETTINGS_SCHEMA, g_settings_new (INTERFACE_SETTINGS_SCHEMA));
-        g_hash_table_insert (manager->priv->settings,
+        g_hash_table_insert (manager->settings,
                              SOUND_SETTINGS_SCHEMA, g_settings_new (SOUND_SETTINGS_SCHEMA));
-        g_hash_table_insert (manager->priv->settings,
+        g_hash_table_insert (manager->settings,
                              PRIVACY_SETTINGS_SCHEMA, g_settings_new (PRIVACY_SETTINGS_SCHEMA));
-        g_hash_table_insert (manager->priv->settings,
+        g_hash_table_insert (manager->settings,
                              WM_SETTINGS_SCHEMA, g_settings_new (WM_SETTINGS_SCHEMA));
-        g_hash_table_insert (manager->priv->settings,
+        g_hash_table_insert (manager->settings,
                              A11Y_SCHEMA, g_settings_new (A11Y_SCHEMA));
 
         session = g_getenv ("XDG_CURRENT_DESKTOP");
@@ -1282,22 +1346,19 @@ gnome_xsettings_manager_start (GnomeXSettingsManager *manager,
                 schema = g_settings_schema_source_lookup (g_settings_schema_source_get_default (),
                                                   CLASSIC_WM_SETTINGS_SCHEMA, FALSE);
                 if (schema) {
-                        g_hash_table_insert (manager->priv->settings,
+                        g_hash_table_insert (manager->settings,
                                              CLASSIC_WM_SETTINGS_SCHEMA,
                                              g_settings_new_full (schema, NULL, NULL));
                         g_settings_schema_unref (schema);
                 }
         }
 
-        g_signal_connect (G_OBJECT (g_hash_table_lookup (manager->priv->settings, INTERFACE_SETTINGS_SCHEMA)), "changed::enable-animations",
-                          G_CALLBACK (enable_animations_changed_cb), manager);
-
         for (i = 0; i < G_N_ELEMENTS (fixed_entries); i++) {
                 FixedEntry *fixed = &fixed_entries[i];
                 (* fixed->func) (manager, fixed);
         }
 
-        list = g_hash_table_get_values (manager->priv->settings);
+        list = g_hash_table_get_values (manager->settings);
         for (l = list; l != NULL; l = l->next) {
                 g_signal_connect_object (G_OBJECT (l->data), "changed", G_CALLBACK (xsettings_callback), manager, 0);
         }
@@ -1307,7 +1368,7 @@ gnome_xsettings_manager_start (GnomeXSettingsManager *manager,
                 GVariant *val;
                 GSettings *settings;
 
-                settings = g_hash_table_lookup (manager->priv->settings,
+                settings = g_hash_table_lookup (manager->settings,
                                                 translations[i].gsettings_schema);
                 if (settings == NULL) {
                         g_warning ("Schemas '%s' has not been setup", translations[i].gsettings_schema);
@@ -1321,28 +1382,27 @@ gnome_xsettings_manager_start (GnomeXSettingsManager *manager,
         }
 
         /* Plugin settings (GTK modules and Xft) */
-        manager->priv->plugin_settings = g_settings_new (XSETTINGS_PLUGIN_SCHEMA);
-        g_signal_connect_object (manager->priv->plugin_settings, "changed", G_CALLBACK (plugin_callback), manager, 0);
+        manager->plugin_settings = g_settings_new (XSETTINGS_PLUGIN_SCHEMA);
+        g_signal_connect_object (manager->plugin_settings, "changed", G_CALLBACK (plugin_callback), manager, 0);
 
-        manager->priv->gtk = gsd_xsettings_gtk_new ();
-        g_signal_connect (G_OBJECT (manager->priv->gtk), "notify::gtk-modules",
+        manager->gtk = gsd_xsettings_gtk_new ();
+        g_signal_connect (G_OBJECT (manager->gtk), "notify::gtk-modules",
                           G_CALLBACK (gtk_modules_callback), manager);
-        gtk_modules_callback (manager->priv->gtk, NULL, manager);
-
-        /* Animation settings */
-        force_disable_animation_changed (G_OBJECT (manager->priv->remote_display), NULL, manager);
+        gtk_modules_callback (manager->gtk, NULL, manager);
 
         /* Xft settings */
         update_xft_settings (manager);
+
+        /* Launch Xwayland services */
+        if (gnome_settings_is_wayland ())
+                launch_xwayland_services ();
 
         register_manager_dbus (manager);
 
         start_fontconfig_monitor (manager);
 
-        start_shell_monitor (manager);
-
-        overrides = g_settings_get_value (manager->priv->plugin_settings, XSETTINGS_OVERRIDE_KEY);
-        xsettings_manager_set_overrides (manager->priv->manager, overrides);
+        overrides = g_settings_get_value (manager->plugin_settings, XSETTINGS_OVERRIDE_KEY);
+        xsettings_manager_set_overrides (manager->manager, overrides);
         queue_notify (manager);
         g_variant_unref (overrides);
 
@@ -1353,107 +1413,110 @@ gnome_xsettings_manager_start (GnomeXSettingsManager *manager,
 }
 
 void
-gnome_xsettings_manager_stop (GnomeXSettingsManager *manager)
+gsd_xsettings_manager_stop (GsdXSettingsManager *manager)
 {
-        GnomeXSettingsManagerPrivate *p = manager->priv;
-
         g_debug ("Stopping xsettings manager");
 
-        g_clear_object (&manager->priv->remote_display);
-
-        if (p->monitors_changed_id) {
-                g_dbus_connection_signal_unsubscribe (p->dbus_connection,
-                                                      p->monitors_changed_id);
-                p->monitors_changed_id = 0;
+        if (manager->introspect_properties_changed_id) {
+                g_dbus_connection_signal_unsubscribe (manager->dbus_connection,
+                                                      manager->introspect_properties_changed_id);
+                manager->introspect_properties_changed_id = 0;
         }
 
-        if (p->display_config_watch_id) {
-                g_bus_unwatch_name (p->display_config_watch_id);
-                p->display_config_watch_id = 0;
+        if (manager->shell_introspect_watch_id) {
+                g_bus_unwatch_name (manager->shell_introspect_watch_id);
+                manager->shell_introspect_watch_id = 0;
         }
 
-        if (p->shell_name_watch_id > 0) {
-                g_bus_unwatch_name (p->shell_name_watch_id);
-                p->shell_name_watch_id = 0;
+        if (manager->monitors_changed_id) {
+                g_dbus_connection_signal_unsubscribe (manager->dbus_connection,
+                                                      manager->monitors_changed_id);
+                manager->monitors_changed_id = 0;
         }
 
-        if (p->manager != NULL) {
-                xsettings_manager_destroy (p->manager);
-                p->manager = NULL;
+        if (manager->display_config_watch_id) {
+                g_bus_unwatch_name (manager->display_config_watch_id);
+                manager->display_config_watch_id = 0;
         }
 
-        if (p->plugin_settings != NULL) {
-                g_signal_handlers_disconnect_by_data (p->plugin_settings, manager);
-                g_object_unref (p->plugin_settings);
-                p->plugin_settings = NULL;
+        if (manager->shell_name_watch_id > 0) {
+                g_bus_unwatch_name (manager->shell_name_watch_id);
+                manager->shell_name_watch_id = 0;
         }
 
-        if (p->gtk_settings_name_id > 0) {
-                g_bus_unown_name (p->gtk_settings_name_id);
-                p->gtk_settings_name_id = 0;
+        if (manager->manager != NULL) {
+                xsettings_manager_destroy (manager->manager);
+                manager->manager = NULL;
         }
 
-        if (p->fontconfig_monitor != NULL) {
-                g_signal_handlers_disconnect_by_data (p->fontconfig_monitor, manager);
-                fc_monitor_stop (p->fontconfig_monitor);
-                g_object_unref (p->fontconfig_monitor);
-                p->fontconfig_monitor = NULL;
+        if (manager->plugin_settings != NULL) {
+                g_signal_handlers_disconnect_by_data (manager->plugin_settings, manager);
+                g_object_unref (manager->plugin_settings);
+                manager->plugin_settings = NULL;
         }
 
-        if (p->settings != NULL) {
-                g_hash_table_destroy (p->settings);
-                p->settings = NULL;
+        if (manager->gtk_settings_name_id > 0) {
+                g_bus_unown_name (manager->gtk_settings_name_id);
+                manager->gtk_settings_name_id = 0;
         }
 
-        if (p->gtk != NULL) {
-                g_object_unref (p->gtk);
-                p->gtk = NULL;
+        if (manager->fontconfig_monitor != NULL) {
+                g_signal_handlers_disconnect_by_data (manager->fontconfig_monitor, manager);
+                fc_monitor_stop (manager->fontconfig_monitor);
+                g_object_unref (manager->fontconfig_monitor);
+                manager->fontconfig_monitor = NULL;
+        }
+
+        if (manager->settings != NULL) {
+                g_hash_table_destroy (manager->settings);
+                manager->settings = NULL;
+        }
+
+        if (manager->gtk != NULL) {
+                g_object_unref (manager->gtk);
+                manager->gtk = NULL;
         }
 }
 
 static void
-gnome_xsettings_manager_class_init (GnomeXSettingsManagerClass *klass)
+gsd_xsettings_manager_class_init (GsdXSettingsManagerClass *klass)
 {
         GObjectClass *object_class = G_OBJECT_CLASS (klass);
 
-        object_class->finalize = gnome_xsettings_manager_finalize;
-
-        g_type_class_add_private (klass, sizeof (GnomeXSettingsManagerPrivate));
+        object_class->finalize = gsd_xsettings_manager_finalize;
 }
 
 static void
-gnome_xsettings_manager_init (GnomeXSettingsManager *manager)
+gsd_xsettings_manager_init (GsdXSettingsManager *manager)
 {
         GError *error = NULL;
 
-        manager->priv = GNOME_XSETTINGS_MANAGER_GET_PRIVATE (manager);
-
-        manager->priv->dbus_connection = g_bus_get_sync (G_BUS_TYPE_SESSION,
+        manager->dbus_connection = g_bus_get_sync (G_BUS_TYPE_SESSION,
                                                          NULL, &error);
-        if (!manager->priv->dbus_connection)
+        if (!manager->dbus_connection)
                 g_error ("Failed to get session bus: %s", error->message);
 }
 
 static void
-gnome_xsettings_manager_finalize (GObject *object)
+gsd_xsettings_manager_finalize (GObject *object)
 {
-        GnomeXSettingsManager *xsettings_manager;
+        GsdXSettingsManager *xsettings_manager;
 
         g_return_if_fail (object != NULL);
-        g_return_if_fail (GNOME_IS_XSETTINGS_MANAGER (object));
+        g_return_if_fail (GSD_IS_XSETTINGS_MANAGER (object));
 
-        xsettings_manager = GNOME_XSETTINGS_MANAGER (object);
+        xsettings_manager = GSD_XSETTINGS_MANAGER (object);
 
-        g_return_if_fail (xsettings_manager->priv != NULL);
+        g_return_if_fail (xsettings_manager != NULL);
 
-        gnome_xsettings_manager_stop (xsettings_manager);
+        gsd_xsettings_manager_stop (xsettings_manager);
 
-        if (xsettings_manager->priv->start_idle_id != 0)
-                g_source_remove (xsettings_manager->priv->start_idle_id);
+        if (xsettings_manager->start_idle_id != 0)
+                g_source_remove (xsettings_manager->start_idle_id);
 
-        g_clear_object (&xsettings_manager->priv->dbus_connection);
+        g_clear_object (&xsettings_manager->dbus_connection);
 
-        G_OBJECT_CLASS (gnome_xsettings_manager_parent_class)->finalize (object);
+        G_OBJECT_CLASS (gsd_xsettings_manager_parent_class)->finalize (object);
 }
 
 static GVariant *
@@ -1465,15 +1528,15 @@ handle_get_property (GDBusConnection *connection,
                      GError **error,
                      gpointer user_data)
 {
-        GnomeXSettingsManager *manager = user_data;
+        GsdXSettingsManager *manager = user_data;
 
         if (g_strcmp0 (property_name, "FontconfigTimestamp") == 0) {
-                return g_variant_new_int64 (manager->priv->fontconfig_timestamp);
+                return g_variant_new_int64 (manager->fontconfig_timestamp);
         } else if (g_strcmp0 (property_name, "Modules") == 0) {
-                const char *modules = gsd_xsettings_gtk_get_modules (manager->priv->gtk);
+                const char *modules = gsd_xsettings_gtk_get_modules (manager->gtk);
                 return g_variant_new_string (modules ? modules : "");
         } else if (g_strcmp0 (property_name, "EnableAnimations") == 0) {
-                return g_variant_new_boolean (manager->priv->enable_animations);
+                return g_variant_new_boolean (manager->enable_animations);
         } else {
                 g_set_error (error, G_DBUS_ERROR, G_DBUS_ERROR_FAILED,
                              "No such interface: %s", interface_name);
@@ -1489,37 +1552,37 @@ static const GDBusInterfaceVTable interface_vtable =
 };
 
 static void
-register_manager_dbus (GnomeXSettingsManager *manager)
+register_manager_dbus (GsdXSettingsManager *manager)
 {
-        g_assert (manager->priv->dbus_connection != NULL);
+        g_assert (manager->dbus_connection != NULL);
 
-        manager->priv->introspection_data = g_dbus_node_info_new_for_xml (introspection_xml, NULL);
-        g_assert (manager->priv->introspection_data != NULL);
+        manager->introspection_data = g_dbus_node_info_new_for_xml (introspection_xml, NULL);
+        g_assert (manager->introspection_data != NULL);
 
-        g_dbus_connection_register_object (manager->priv->dbus_connection,
+        g_dbus_connection_register_object (manager->dbus_connection,
                                            GTK_SETTINGS_DBUS_PATH,
-                                           manager->priv->introspection_data->interfaces[0],
+                                           manager->introspection_data->interfaces[0],
                                            &interface_vtable,
                                            manager,
                                            NULL,
                                            NULL);
 
-        manager->priv->gtk_settings_name_id = g_bus_own_name_on_connection (manager->priv->dbus_connection,
-                                                                            GTK_SETTINGS_DBUS_NAME,
-                                                                            G_BUS_NAME_OWNER_FLAGS_NONE,
-                                                                            NULL, NULL, NULL, NULL);
+        manager->gtk_settings_name_id = g_bus_own_name_on_connection (manager->dbus_connection,
+                                                                      GTK_SETTINGS_DBUS_NAME,
+                                                                      G_BUS_NAME_OWNER_FLAGS_NONE,
+                                                                      NULL, NULL, NULL, NULL);
 }
 
-GnomeXSettingsManager *
-gnome_xsettings_manager_new (void)
+GsdXSettingsManager *
+gsd_xsettings_manager_new (void)
 {
         if (manager_object != NULL) {
                 g_object_ref (manager_object);
         } else {
-                manager_object = g_object_new (GNOME_TYPE_XSETTINGS_MANAGER, NULL);
+                manager_object = g_object_new (GSD_TYPE_XSETTINGS_MANAGER, NULL);
                 g_object_add_weak_pointer (manager_object,
                                            (gpointer *) &manager_object);
         }
 
-        return GNOME_XSETTINGS_MANAGER (manager_object);
+        return GSD_XSETTINGS_MANAGER (manager_object);
 }

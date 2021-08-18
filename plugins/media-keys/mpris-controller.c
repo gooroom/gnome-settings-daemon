@@ -20,45 +20,38 @@
 #include "bus-watch-namespace.h"
 #include <gio/gio.h>
 
-G_DEFINE_TYPE (MprisController, mpris_controller, G_TYPE_OBJECT)
-
-#define CONTROLLER_PRIVATE(o) \
-  (G_TYPE_INSTANCE_GET_PRIVATE ((o), MPRIS_TYPE_CONTROLLER, MprisControllerPrivate))
-
 enum {
   PROP_0,
   PROP_HAS_ACTIVE_PLAYER
 };
 
-struct _MprisControllerPrivate
+struct _MprisController
 {
+  GObject parent;
+
   GCancellable *cancellable;
   GDBusProxy *mpris_client_proxy;
   guint namespace_watcher_id;
-  GSList *other_players;
-  gboolean connecting;
+  GSList *other_proxies;
 };
 
+G_DEFINE_TYPE (MprisController, mpris_controller, G_TYPE_OBJECT)
 
 static void
 mpris_controller_dispose (GObject *object)
 {
-  MprisControllerPrivate *priv = MPRIS_CONTROLLER (object)->priv;
+  MprisController *self = MPRIS_CONTROLLER (object);
 
-  g_clear_object (&priv->cancellable);
-  g_clear_object (&priv->mpris_client_proxy);
+  g_clear_object (&self->cancellable);
+  g_clear_object (&self->mpris_client_proxy);
 
-  if (priv->namespace_watcher_id)
+  if (self->namespace_watcher_id)
     {
-      bus_unwatch_namespace (priv->namespace_watcher_id);
-      priv->namespace_watcher_id = 0;
+      bus_unwatch_namespace (self->namespace_watcher_id);
+      self->namespace_watcher_id = 0;
     }
 
-  if (priv->other_players)
-    {
-      g_slist_free_full (priv->other_players, g_free);
-      priv->other_players = NULL;
-    }
+  g_slist_free_full (g_steal_pointer (&self->other_proxies), g_object_unref);
 
   G_OBJECT_CLASS (mpris_controller_parent_class)->dispose (object);
 }
@@ -84,21 +77,109 @@ mpris_proxy_call_done (GObject      *object,
 gboolean
 mpris_controller_key (MprisController *self, const gchar *key)
 {
-  MprisControllerPrivate *priv = MPRIS_CONTROLLER (self)->priv;
-
-  if (!priv->mpris_client_proxy)
+  if (!self->mpris_client_proxy)
     return FALSE;
 
   if (g_strcmp0 (key, "Play") == 0)
     key = "PlayPause";
 
   g_debug ("calling %s over dbus to mpris client %s",
-           key, g_dbus_proxy_get_name (priv->mpris_client_proxy));
-  g_dbus_proxy_call (priv->mpris_client_proxy,
-                     key, NULL, 0, -1, priv->cancellable,
+           key, g_dbus_proxy_get_name (self->mpris_client_proxy));
+  g_dbus_proxy_call (self->mpris_client_proxy,
+                     key, NULL, 0, -1, self->cancellable,
                      mpris_proxy_call_done,
                      NULL);
   return TRUE;
+}
+
+static gboolean
+mpris_client_is_playing (GDBusProxy *proxy)
+{
+  g_autoptr(GVariant) playback_status;
+  const gchar *status_str;
+
+  playback_status = g_dbus_proxy_get_cached_property (proxy, "PlaybackStatus");
+  if (!playback_status)
+    return FALSE;
+
+  if (!g_variant_is_of_type (playback_status, G_VARIANT_TYPE_STRING))
+    return FALSE;
+
+  status_str = g_variant_get_string (playback_status, NULL);
+  return g_strcmp0 (status_str, "Playing") == 0;
+}
+
+static void
+mpris_client_notify_name_owner_cb (GDBusProxy      *proxy,
+                                   GParamSpec      *pspec,
+                                   MprisController *self)
+{
+  g_autofree gchar *name_owner = NULL;
+  GSList *first;
+
+  /* Owner changed, but the proxy is still valid. */
+  name_owner = g_dbus_proxy_get_name_owner (proxy);
+  if (name_owner)
+    return;
+
+  if (proxy == self->mpris_client_proxy)
+    {
+      g_debug ("Clearing the current MPRIS client proxy");
+      g_clear_object (&self->mpris_client_proxy);
+
+      if ((first = self->other_proxies))
+        {
+          self->mpris_client_proxy = first->data;
+          self->other_proxies = first->next;
+          g_slist_free_1 (first);
+
+          g_debug ("Falling back to MPRIS client %s",
+                   g_dbus_proxy_get_name (self->mpris_client_proxy));
+        }
+      else
+        {
+          g_object_notify (G_OBJECT (self), "has-active-player");
+        }
+    }
+  else
+    {
+      g_debug ("Forgetting MPRIS client %s", g_dbus_proxy_get_name (proxy));
+      self->other_proxies = g_slist_remove (self->other_proxies, proxy);
+      g_object_unref (proxy);
+    }
+}
+
+static void
+mpris_client_properties_changed_cb (GDBusProxy *proxy,
+                                    GVariant   *changed_properties,
+                                    GStrv       invalidated_properties,
+                                    gpointer    user_data)
+{
+  MprisController *self = MPRIS_CONTROLLER (user_data);
+  GDBusProxy *current_proxy;
+
+  current_proxy = self->mpris_client_proxy;
+  if (current_proxy == proxy)
+    return;
+
+  if (current_proxy && mpris_client_is_playing (current_proxy))
+    return;
+
+  if (mpris_client_is_playing (proxy))
+    {
+      g_debug ("Switching to MPRIS client %s because it is playing",
+               g_dbus_proxy_get_name (proxy));
+
+      self->other_proxies = g_slist_remove (self->other_proxies, proxy);
+
+      if (current_proxy)
+        self->other_proxies = g_slist_prepend (self->other_proxies, current_proxy);
+
+      self->mpris_client_proxy = proxy;
+
+      if (!current_proxy)
+        g_object_notify (user_data, "has-active-player");
+    }
 }
 
 static void
@@ -106,23 +187,47 @@ mpris_proxy_ready_cb (GObject      *object,
                       GAsyncResult *res,
                       gpointer      user_data)
 {
-  MprisControllerPrivate *priv;
+  MprisController *self = MPRIS_CONTROLLER (user_data);
   GError *error = NULL;
   GDBusProxy *proxy;
+  const gchar *name;
 
   proxy = g_dbus_proxy_new_for_bus_finish (res, &error);
 
   if (!proxy)
     {
       if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
-        g_warning ("Error connecting to mpris interface %s", error->message);
+        g_warning ("Error connecting to MPRIS interface: %s", error->message);
       g_clear_error (&error);
       return;
     }
 
-  priv = MPRIS_CONTROLLER (user_data)->priv;
-  priv->mpris_client_proxy = proxy;
-  priv->connecting = FALSE;
+  g_signal_connect (proxy, "notify::g-name-owner",
+                    G_CALLBACK (mpris_client_notify_name_owner_cb), user_data);
+
+  g_signal_connect (proxy, "g-properties-changed",
+                    G_CALLBACK (mpris_client_properties_changed_cb), user_data);
+
+  name = g_dbus_proxy_get_name (proxy);
+
+  if (self->mpris_client_proxy)
+    {
+      if (mpris_client_is_playing (self->mpris_client_proxy))
+        {
+          g_debug ("Remembering %s for later because the current MPRIS client is playing",
+                   name);
+          self->other_proxies = g_slist_prepend (self->other_proxies, proxy);
+          return;
+        }
+
+      g_debug ("Remembering the current MPRIS client for later");
+      self->other_proxies =
+        g_slist_prepend (self->other_proxies, self->mpris_client_proxy);
+    }
+
+  g_debug ("Switching to MPRIS client %s because it just appeared", name);
+
+  self->mpris_client_proxy = proxy;
 
   g_object_notify (user_data, "has-active-player");
 }
@@ -130,19 +235,16 @@ mpris_proxy_ready_cb (GObject      *object,
 static void
 start_mpris_proxy (MprisController *self, const gchar *name)
 {
-  MprisControllerPrivate *priv = MPRIS_CONTROLLER (self)->priv;
-
-  g_debug ("Creating proxy for for %s", name);
+  g_debug ("Creating proxy for %s", name);
   g_dbus_proxy_new_for_bus (G_BUS_TYPE_SESSION,
                             0,
                             NULL,
                             name,
                             "/org/mpris/MediaPlayer2",
                             "org.mpris.MediaPlayer2.Player",
-                            priv->cancellable,
+                            self->cancellable,
                             mpris_proxy_ready_cb,
                             self);
-  priv->connecting = TRUE;
 }
 
 static void
@@ -151,56 +253,18 @@ mpris_player_appeared (GDBusConnection *connection,
                        const gchar     *name_owner,
                        gpointer         user_data)
 {
-  MprisController *self = user_data;
-  MprisControllerPrivate *priv = MPRIS_CONTROLLER (self)->priv;
-
-  if (priv->mpris_client_proxy == NULL && !priv->connecting)
-    start_mpris_proxy (self, name);
-  else
-    self->priv->other_players = g_slist_prepend (self->priv->other_players, g_strdup (name));
-}
-
-static void
-mpris_player_vanished (GDBusConnection *connection,
-                       const gchar     *name,
-                       gpointer         user_data)
-{
-  MprisController *self = user_data;
-  MprisControllerPrivate *priv = MPRIS_CONTROLLER (self)->priv;
-
-  if (priv->mpris_client_proxy &&
-      g_strcmp0 (name, g_dbus_proxy_get_name (priv->mpris_client_proxy)) == 0)
-    {
-      g_clear_object (&priv->mpris_client_proxy);
-      g_object_notify (user_data, "has-active-player");
-
-      /* take the next one if there's one */
-      if (self->priv->other_players && !priv->connecting)
-        {
-          GSList *first;
-          gchar *name;
-
-          first = self->priv->other_players;
-          name = first->data;
-
-          start_mpris_proxy (self, name);
-
-          self->priv->other_players = self->priv->other_players->next;
-          g_free (name);
-          g_slist_free_1 (first);
-        }
-    }
+  start_mpris_proxy (MPRIS_CONTROLLER (user_data), name);
 }
 
 static void
 mpris_controller_constructed (GObject *object)
 {
-  MprisControllerPrivate *priv = MPRIS_CONTROLLER (object)->priv;
+  MprisController *self = MPRIS_CONTROLLER (object);
 
-  priv->namespace_watcher_id = bus_watch_namespace (G_BUS_TYPE_SESSION,
+  self->namespace_watcher_id = bus_watch_namespace (G_BUS_TYPE_SESSION,
                                                     "org.mpris.MediaPlayer2",
                                                     mpris_player_appeared,
-                                                    mpris_player_vanished,
+                                                    NULL,
                                                     MPRIS_CONTROLLER (object),
                                                     NULL);
 }
@@ -229,8 +293,6 @@ mpris_controller_class_init (MprisControllerClass *klass)
 {
   GObjectClass *object_class = G_OBJECT_CLASS (klass);
 
-  g_type_class_add_private (klass, sizeof (MprisControllerPrivate));
-
   object_class->constructed = mpris_controller_constructed;
   object_class->dispose = mpris_controller_dispose;
   object_class->get_property = mpris_controller_get_property;
@@ -247,7 +309,6 @@ mpris_controller_class_init (MprisControllerClass *klass)
 static void
 mpris_controller_init (MprisController *self)
 {
-  self->priv = CONTROLLER_PRIVATE (self);
 }
 
 gboolean
@@ -255,7 +316,7 @@ mpris_controller_get_has_active_player (MprisController *controller)
 {
   g_return_val_if_fail (MPRIS_IS_CONTROLLER (controller), FALSE);
 
-  return (controller->priv->mpris_client_proxy != NULL);
+  return (controller->mpris_client_proxy != NULL);
 }
 
 MprisController *

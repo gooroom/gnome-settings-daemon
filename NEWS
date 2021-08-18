@@ -1,12 +1,322 @@
 ==============
-Version 3.30.2
+Version 3.38.2
+==============
+
+rfkill:
+- Fix reading /dev/rfkill on newer kernels
+
+housekeeping:
+- Fix crash when atime is not present #556
+
+power:
+- Avoid automatic logout when inappropriate (greeter session)
+- Only one warn once when the battery of external devices runs low #108
+
+usb-protection:
+- Do not warn if usbguard is not installed #567
+
+datetime:
+- Optimizations of the required DB lookups
+
+==============
+Version 3.38.1
+==============
+Sound:
+- Update g-v-c dependency. Necessary to support related UCM
+  changes in ALSA and Pulseaudio
+
+Media-keys:
+- Don't throw unnecessary warnings
+
+Print-notification:
+- Disable plugin if CUPS is diabled
+
+- Translation updates
+
+==============
+Version 3.38.0
 ==============
 - Translation updates
-- Fixes for build tests
+
+===============
+Version 3.37.92
+===============
+- Translation updates
+
+USB-protection:
+- Relax the whitelist to all HIDs and HUBs
+
+==============
+Version 3.37.1
+==============
+- Translation updates
+
+WWan:
+- Translatable string improvements
+
+Media-keys:
+- Use well-known name for screencast proxy
+
+Xsettings:
+- Fix race condition in fontconfig timestamp test
+
+Power:
+- Drop lid switch inhibitor when session is inactive
+
+==============
+Version 3.37.0
+==============
+- CI improvements
+- Translation updates
+- Revamp of systemd service structure
+
+Media-keys:
+- Add static mapping for XF86RotationLockToggle
+- Use heuristic to switch MPRIS clients
+
+Power:
+- Ambient light moving average now time-aware
+
+WWan:
+- Handle multiple devices
+- Handle PUK unlocking
+- Other fixes
+
+Wacom:
+- Drop LED helper, handled by the kernel for long enough.
+
+==============
+Version 3.36.1
+==============
+- Translation updates
+- CI improvements
+
+Media-keys:
+- Do not consider sound feedback a reason to inhibit sound
+  feedback.
+
+Print-notification:
+- Fix a minor warning on shutdown
+
+Sharing:
+- Do not warn after starting/stopping nonexistent services
+
+==============
+Version 3.36.0
+==============
+-Translation updates
+
+===============
+Version 3.35.92
+===============
+- Translation updates
+- CI improvements
+
+Xsettings:
+- Load scripts from /etc/xdg/Xwayland-session.d in order to lazily set up
+  X11 sessions for wayland (e.g. Xwayland being raised on demand)
+- Delegate on gnome-shell to enable/disable animations
+
+Sharing:
+- Drop support for vino. It is replaced by the windowing agnostic
+  gnome-remote-desktop in other places of the stack.
+
+Wacom:
+- Fix build without wayland
+
+Housekeeping:
+- Use atime instead of mtime in thumbnail cleaner, if available
+- Avoid crossing into different filesystems in cleanup dirs (except trash:)
+
+Power:
+- Add missing error check to realpath call
+
+===============
+Version 3.35.91
+===============
+- Translation updates
+- Add capability to disable USB while the lockscreen is on
+
+Power:
+- Increase permissible runtime for some tests
+
+Color:
+- Look for builtin profiles in UEFI
+
+==============
+Version 3.35.0
+==============
+- Translation updates
+- Lower systemd stop timeout
+
+Media-keys:
+- Place spawned processes in a systemd scope
+- Add volume step configuration key
+- Make brightness a 0.0..1.0 float in DBus
+- Let the screenshot service handle saving to clipboard
+- Fix crash on old settings migration
+- Skip volume-change feedback while playing
+
+Power:
+- Fix rounding of brightness value
+- Use logind helper to change backlight brightness
+
+Smartcard:
+- Change manager to non-blocking
+- Use correct parent type for structs
+- Initialize pointer before use
+
+===============
+Version 3.33.90
+===============
+- Translation updates
+- Add systemd user service files for all the plugins
+- With the exception of gsd-xsettings, daemons do not use the GDK X11
+  backend anymore
+
+WWAN:
+- New daemon, handles WWAN device settings
+
+Mouse:
+- Removed daemon, everything is now implemented in mutter
+
+Clipboard:
+- Removed daemon, everything is now implemented in mutter
+
+Color:
+- Use Planckian calculations on night light
+
+Rfkill:
+- Handle airplane mode for WWAN interfaces
+
+XSettings:
+- Round Xft.dpi setting to an integer
+- Add entry for overlay scrolling setting
+
+Media-keys:
+- Use device node from AcceleratorActivated arguments
+
+==============
+Version 3.33.0
+==============
+- Translation updates
+- Compile warning fixes
+
+Media-keys:
+- Keygrabbing has been reworked. The new UngrabAccelerators DBus API on the
+  shell is now required. Non-GNOME Desktops using g-s-d will need to be
+  updated for this.
+- Add mapping for screen brightness cycle key
+- Fix launched clients inheriting DESKTOP_AUTOSTART_ID
+- Signal connector rather than output ID for OSD
+- Fix MPRIS issues with disconnecting clients
+- Allow mapping of hard-coded keys
+
+Power:
+- Fix memory leak
+- Signal connector rather than output ID for OSD
+- Only disable Suspend/Hibernate actions inside VM
+- Remove special handling of tablet devices
+
+Color:
+- Allow night light to be always on
+
+Mouse:
+- Remove locate-pointer, in favor of gnome-shell handling
+- Remove mousetweaks support, in favor of gnome-shell handling
+
+Keyboard:
+- Remove numlock persistence, in favor of gnome-shell handling
+
+==============
+Version 3.32.0
+==============
+- No changes since 3.31.92
+
+===============
+Version 3.31.92
+===============
+- Translation updates
+
+Power:
+- Only test backlight on linux
+
+===============
+Version 3.31.91
+===============
+- Translation updates
+
+Media-keys:
+- Ignore key repeat on certain shortcuts (Needs up-to-date
+  mutter and gnome-shell)
+
+Housekeeping:
+- Fix overflow
+
+===============
+Version 3.31.90
+===============
+- Translation updates
+- Remove libXtst as a dependency
+
+Keyboard:
+- Enable ibus for OSK purposes on X11
+
+Power:
+- Add x-gnome-privacy-scope hints to power notifications
+- Define brightness to be -1 if builtin display is disabled
+
+Smartcard:
+- Wait until smartcards are inspected before locking screen
+- handle a smartcard getting removed very shortly after login
+
+==============
+Version 3.31.2
+==============
+- Translation updates
+
+Color:
+- Add DBus API to preview Night Light for a few seconds
 
 Media-keys:
 - Default to interactive shutdown action for power button if
   the action is not supported.
+
+Power:
+- Avoid setting GError twice
+- Speed up tests by splitting into chunks
+
+Print-notification:
+- Ignore Server* messages from CUPS not meant to us
+
+Rfkill:
+- Use GUdev to monitor rfkill device pressence
+
+==============
+Version 3.31.1
+==============
+- Translation updates
+
+Xsettings:
+- always use mutter-computed UI scaling value
+
+Wacom:
+- Drop tablet/touchscreen mapping to outputs. Mutter now
+  handles this entirely.
+
+
+==============
+Version 3.31.0
+==============
+- Translation updates
+- Build improvements
+- Add desktop-entry hints to notifications
+
+Power:
+- Guard against events from the wrong device type
+- Hide suspend-then-hibernate behind a meson option
+
+Media-keys:
 - Increase GSD_REENABLE_POWER_BUTTON_DELAY to 3 seconds
 - Add mapping for Ctrl + media-key for some media-keys
 
@@ -14,57 +324,8 @@ Rfkill:
 - Fix GIOChannel encoding
 
 Color:
-- Correct temperature interpolation corner cases
-
-================
-Version 3.30.1.2
-================
-
-This release by default *removes* the new feature that was added in 3.29.0 to
-use SuspendAndHibernate when available. You can re-enable the feature using the
-"experimental_suspend_then_hibernate" meson option again.
-
-There are two major issues with the new feature in the current form, and fixing
-it will require more changes that are not feasible in the stable release cycle.
-
-The two main issues are:
- * Hibernation is often not properly supported. The reasons range from it being
-   simply impossible (secure boot), to driver and firmware issues when resuming
-   and also distribution issues where the system is not correctly set-up and
-   we cannot detect the issue.
- * It was missed that the support added into g-s-d is incomplete and therefore
-   creates an inconsistent user experience. In particular, we have four major
-   methods to suspend the machine, but only two are affected:
-    - hardware power button: will use suspend-then-hibernate if enabled and available
-    - idle suspend: will use suspend-then-hibernate if enabled and available
-    - suspend in gnome-shell: always suspends
-    - lid closing: always suspends (systemd)
-
-Also relevant in this discussion is the proposed change in upstream systemd to
-allow disabling hibernation even if it is detected to work:
-  https://github.com/systemd/systemd/pull/10262
-
-================
-Version 3.30.1.1
-================
-
-Color:
-- Do not leak GSource
-
-==============
-Version 3.30.1
-==============
-- Translation updates
-
-Power:
-- Guard against events from the wrong device type
-
-Color:
 - Fix check for timerfd
-
-General:
-- Use set10 consistently in build
-- Fix build with wayland disabled
+- Correct temperature interpolation corner cases
 
 ==============
 Version 3.30.0

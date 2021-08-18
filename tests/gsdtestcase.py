@@ -61,6 +61,9 @@ class GSDTestCase(X11SessionTestCase):
         os.environ['LC_MESSAGES'] = 'C'
         klass.workdir = tempfile.mkdtemp(prefix='gsd-plugin-test')
 
+        # Prevent applications from accessing an outside session manager
+        os.environ['SESSION_MANAGER'] = ''
+
         # Signal to mutter and gnome-session that we are using X11
         os.environ['XDG_SESSION_TYPE'] = 'x11'
 
@@ -171,6 +174,8 @@ class GSDTestCase(X11SessionTestCase):
         # This should be removed once we can depend on dbusmock 0.17.3
         self.logind_obj.AddMethod('org.freedesktop.login1.Manager', 'SuspendThenHibernate', 'b', '', '')
         self.logind_obj.AddMethod('org.freedesktop.login1.Manager', 'CanSuspendThenHibernate', '', 's', 'ret = "%s"' % parameters.get('CanSuspendThenHibernate', 'yes'))
+
+        self.logind_obj.AddMethod('org.freedesktop.login1.Session', 'SetBrightness', 'ssu', '', '')
 
         # set log to nonblocking
         set_nonblock(self.logind.stdout)

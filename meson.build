@@ -1,8 +1,8 @@
 project(
   'gnome-settings-daemon', 'c',
-  version: '3.30.2',
+  version: '3.38.2',
   license: [ 'GPL2+', 'LGPLv2+' ],
-  meson_version: '>= 0.44.0'
+  meson_version: '>= 0.47.0'
 )
 
 gsd_version = meson.project_version()
@@ -12,6 +12,11 @@ gsd_major_version = version_array[0].to_int()
 gsd_api_version_minor = 0
 gsd_api_version = '@0@.@1@'.format(gsd_major_version, gsd_api_version_minor)
 gsd_api_name = '@0@-@1@'.format(meson.project_name(), gsd_api_version)
+
+glib_min_version = '2.56'
+
+glib_version_def = 'GLIB_VERSION_@0@_@1@'.format(
+    glib_min_version.split('.')[0], glib_min_version.split('.')[1])
 
 gsd_prefix = get_option('prefix')
 gsd_bindir = join_paths(gsd_prefix, get_option('bindir'))
@@ -66,7 +71,9 @@ if gsd_buildtype.contains('debug')
     '-Wnested-externs',
     '-Wno-strict-aliasing',
     '-Wno-sign-compare',
-    '-Wpointer-arith'
+    '-Wpointer-arith',
+    '-DGLIB_VERSION_MIN_REQUIRED=' + glib_version_def,
+    '-DGLIB_VERSION_MAX_ALLOWED=' + glib_version_def,
   ]
 
   compiler_flags = cc.get_supported_arguments(test_cflags)
@@ -82,12 +89,12 @@ endif
 
 add_project_arguments(common_flags + compiler_flags, language: 'c')
 
-colord_dep = dependency('colord', version: '>= 1.0.2')
+glib_dep = dependency('glib-2.0', version: '>=' + glib_min_version)
 geocode_glib_dep = dependency('geocode-glib-1.0', version: '>= 3.10.0')
 gio_dep = dependency('gio-2.0', version: '>= 2.53.0')
 gio_unix_dep = dependency('gio-unix-2.0')
-gnome_desktop_dep = dependency('gnome-desktop-3.0', version: '>= 3.11.1')
-gsettings_desktop_dep = dependency('gsettings-desktop-schemas', version: '>= 3.27.90')
+gnome_desktop_dep = dependency('gnome-desktop-3.0', version: '>= 3.34.2')
+gsettings_desktop_dep = dependency('gsettings-desktop-schemas', version: '>= 3.35.91')
 gtk_dep = dependency('gtk+-3.0', version: '>= 3.15.3')
 gtk_x11_dep = dependency('gtk+-x11-3.0')
 gweather_dep = dependency('gweather-3.0', version: '>= 3.9.5')
@@ -97,10 +104,18 @@ libgeoclue_dep = dependency('libgeoclue-2.0', version: '>= 2.3.1')
 libnotify_dep = dependency('libnotify', version: '>= 0.7.3')
 libpulse_mainloop_glib_dep = dependency('libpulse-mainloop-glib', version: '>= 2.0')
 pango_dep = dependency('pango', version: '>= 1.20.0')
-polkit_gobject_dep = dependency('polkit-gobject-1', version: '>= 0.103')
-upower_glib_dep = dependency('upower-glib', version: '>= 0.99.0')
+polkit_gobject_dep = dependency('polkit-gobject-1', version: '>= 0.114')
+upower_glib_dep = dependency('upower-glib', version: '>= 0.99.8')
 x11_dep = dependency('x11')
-xtst_dep = dependency('xtst')
+
+enable_systemd = get_option('systemd')
+if enable_systemd
+  systemd_dep = dependency('systemd', version: '>= 243', required: false)
+  assert(systemd_dep.found(), 'Systemd support explicitly required, but systemd not found')
+
+   systemd_userunitdir = systemd_dep.get_pkgconfig_variable('systemduserunitdir',
+                                                            define_variable: ['prefix', gsd_prefix])
+endif
 
 m_dep = cc.find_library('m')
 
@@ -117,17 +132,15 @@ libgvc = subproject(
 )
 libgvc_dep = libgvc.get_variable('libgvc_dep')
 
-# Suspend-then-hibernate kill switch
-use_suspend_then_hibernate = get_option('experimental_suspend_then_hibernate')
-config_h.set10('USE_SUSPEND_THEN_HIBERNATE', use_suspend_then_hibernate)
-
 # GUdev integration (default enabled)
 enable_gudev = get_option('gudev')
 if enable_gudev
-  assert(enable_gudev, 'GUdev is not optional on Linux platforms')
   gudev_dep = dependency('gudev-1.0')
 endif
 config_h.set10('HAVE_GUDEV', enable_gudev)
+if host_is_linux
+  assert(enable_gudev, 'GUdev is not optional on Linux platforms')
+endif
 
 has_timerfd_create = cc.has_function('timerfd_create')
 config_h.set10('HAVE_TIMERFD', has_timerfd_create)
@@ -160,6 +173,8 @@ if enable_smartcard
   endif
 endif
 
+enable_usb_protection = get_option('usb-protection')
+
 # CUPS
 enable_cups = get_option('cups')
 if enable_cups
@@ -185,11 +200,19 @@ enable_rfkill = get_option('rfkill')
 assert(enable_rfkill or not host_is_linux, 'rfkill is not optional on Linux platforms')
 if enable_rfkill
   assert(cc.has_header('linux/rfkill.h'), 'rfkill support requested but RFKill headers not found')
+  assert(enable_gudev, 'GUdev is required for rfkill support')
 
   udev_dir = get_option('udev_dir')
   if udev_dir == ''
     udev_dir = dependency('udev').get_pkgconfig_variable('udevdir')
   endif
+endif
+
+# wwan
+enable_wwan = get_option('wwan')
+if enable_wwan
+  gcr_base_dep = dependency('gcr-base-3', version: '>= 3.7.5')
+  mm_glib_dep = dependency('mm-glib', version: '>= 1.0')
 endif
 
 # Sharing plugin
@@ -200,6 +223,12 @@ if enable_network_manager
   libnm_dep = dependency('libnm', version: '>= 1.0')
 endif
 config_h.set10('HAVE_NETWORK_MANAGER', enable_network_manager)
+
+# colord
+enable_colord = get_option('colord')
+if enable_colord
+  colord_dep = dependency('colord', version: '>= 1.3.5')
+endif
 
 gnome = import('gnome')
 i18n = import('i18n')
@@ -239,13 +268,16 @@ output += '        cflags:                   ' + ' '.join(compiler_flags) + '\n\
 output += '        ALSA support:             ' + enable_alsa.to_string() + '\n'
 output += '        NetworkManager support:   ' + enable_network_manager.to_string() + '\n'
 output += '        Smartcard support:        ' + enable_smartcard.to_string() + '\n'
+output += '        USB Protection support:   ' + enable_usb_protection.to_string() + '\n'
 output += '        Cups support:             ' + enable_cups.to_string() + '\n'
 output += '        Wayland support:          ' + enable_wayland.to_string() + '\n'
 output += '        Wacom support:            ' + enable_wacom.to_string() + '\n'
 output += '        RFKill support:           ' + enable_rfkill.to_string() + '\n'
-output += '        Suspend-then-hibernate:   ' + use_suspend_then_hibernate.to_string() + '\n'
 if enable_smartcard
   output += '        System nssdb:             ' + system_nssdb_dir + '\n'
+endif
+if enable_systemd
+  output += '        Systemd user unit dir:    ' + systemd_userunitdir + '\n'
 endif
 if enable_rfkill
   output += '        udev dir:                 ' + udev_dir + '\n'

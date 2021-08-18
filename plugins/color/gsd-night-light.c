@@ -33,6 +33,7 @@
 struct _GsdNightLight {
         GObject            parent;
         GSettings         *settings;
+        gboolean           forced;
         gboolean           disabled_until_tmw;
         GDateTime         *disabled_until_tmw_dt;
         gboolean           geoclue_enabled;
@@ -60,6 +61,7 @@ enum {
         PROP_SUNSET,
         PROP_TEMPERATURE,
         PROP_DISABLED_UNTIL_TMW,
+        PROP_FORCED,
         PROP_LAST
 };
 
@@ -255,6 +257,14 @@ night_light_recheck (GsdNightLight *self)
         guint temp_smeared;
         g_autoptr(GDateTime) dt_now = gsd_night_light_get_date_time_now (self);
 
+        /* Forced mode, just set the temperature to night light.
+         * Proper rechecking will happen once forced mode is disabled again */
+        if (self->forced) {
+                temperature = g_settings_get_uint (self->settings, "night-light-temperature");
+                gsd_night_light_set_temperature (self, temperature);
+                return;
+        }
+
         /* enabled */
         if (!g_settings_get_boolean (self->settings, "night-light-enabled")) {
                 g_debug ("night light disabled, resetting");
@@ -295,11 +305,12 @@ night_light_recheck (GsdNightLight *self)
                 if (time_span > (GTimeSpan) 24 * 60 * 60 * 1000000) {
                         g_debug ("night light disabled until tomorrow is older than 24h, resetting disabled until tomorrow");
                         reset = TRUE;
-                } else {
+                } else if (time_span > 0) {
                         /* Or if a sunrise lies between the time it was disabled and now. */
                         gdouble frac_disabled;
                         frac_disabled = gsd_night_light_frac_day_from_dt (self->disabled_until_tmw_dt);
-                        if (gsd_night_light_frac_day_is_between (schedule_to,
+                        if (frac_disabled != frac_day &&
+                            gsd_night_light_frac_day_is_between (schedule_to,
                                                                  frac_disabled,
                                                                  frac_day)) {
                                 g_debug ("night light sun rise happened, resetting disabled until tomorrow");
@@ -319,9 +330,14 @@ night_light_recheck (GsdNightLight *self)
                 }
         }
 
+        /* lower smearing period to be smaller than the time between start/stop */
+        smear = MIN (smear,
+                     MIN (     ABS (schedule_to - schedule_from),
+                          24 - ABS (schedule_to - schedule_from)));
+
         if (!gsd_night_light_frac_day_is_between (frac_day,
-                                                    schedule_from - smear,
-                                                    schedule_to)) {
+                                                  schedule_from - smear,
+                                                  schedule_to)) {
                 g_debug ("not time for night-light");
                 gsd_night_light_set_active (self, FALSE);
                 return;
@@ -338,15 +354,18 @@ night_light_recheck (GsdNightLight *self)
          *   \--------------------/
          */
         temperature = g_settings_get_uint (self->settings, "night-light-temperature");
-        if (gsd_night_light_frac_day_is_between (frac_day,
-                                                   schedule_from - smear,
-                                                   schedule_from)) {
+        if (smear < 0.01) {
+                /* Don't try to smear for extremely short or zero periods */
+                temp_smeared = temperature;
+        } else if (gsd_night_light_frac_day_is_between (frac_day,
+                                                        schedule_from - smear,
+                                                        schedule_from)) {
                 gdouble factor = 1.f - ((frac_day - (schedule_from - smear)) / smear);
                 temp_smeared = linear_interpolate (GSD_COLOR_TEMPERATURE_DEFAULT,
                                                    temperature, factor);
         } else if (gsd_night_light_frac_day_is_between (frac_day,
-                                                          schedule_to - smear,
-                                                          schedule_to)) {
+                                                        schedule_to - smear,
+                                                        schedule_to)) {
                 gdouble factor = (frac_day - (schedule_to - smear)) / smear;
                 temp_smeared = linear_interpolate (GSD_COLOR_TEMPERATURE_DEFAULT,
                                                    temperature, factor);
@@ -404,7 +423,9 @@ poll_timeout_create (GsdNightLight *self)
         if (self->source != NULL)
                 return;
 
-        dt_now = gsd_night_light_get_date_time_now (self);
+        /* It is not a good idea to make this overridable, it just creates
+         * an infinite loop as a fixed date for testing just doesn't work. */
+        dt_now = g_date_time_new_now_local ();
         dt_expiry = g_date_time_add_seconds (dt_now, GSD_NIGHT_LIGHT_POLL_TIMEOUT);
         self->source = _gnome_datetime_source_new (dt_now,
                                                    dt_expiry,
@@ -542,6 +563,29 @@ gsd_night_light_get_disabled_until_tmw (GsdNightLight *self)
         return self->disabled_until_tmw;
 }
 
+void
+gsd_night_light_set_forced (GsdNightLight *self, gboolean value)
+{
+        if (self->forced == value)
+                return;
+
+        self->forced = value;
+        g_object_notify (G_OBJECT (self), "forced");
+
+        /* A simple recheck might not reset the temperature if
+         * night light is currently disabled. */
+        if (!self->forced && !self->cached_active)
+                gsd_night_light_set_temperature (self, GSD_COLOR_TEMPERATURE_DEFAULT);
+
+        night_light_recheck (self);
+}
+
+gboolean
+gsd_night_light_get_forced (GsdNightLight *self)
+{
+        return self->forced;
+}
+
 gboolean
 gsd_night_light_get_active (GsdNightLight *self)
 {
@@ -600,7 +644,7 @@ gsd_night_light_finalize (GObject *object)
         poll_smooth_destroy (self);
 
         g_clear_object (&self->settings);
-        g_clear_pointer (&self->datetime_override, (GDestroyNotify) g_date_time_unref);
+        g_clear_pointer (&self->datetime_override, g_date_time_unref);
         g_clear_pointer (&self->disabled_until_tmw_dt, g_date_time_unref);
 
         if (self->validate_id > 0) {
@@ -633,6 +677,9 @@ gsd_night_light_set_property (GObject      *object,
         case PROP_DISABLED_UNTIL_TMW:
                 gsd_night_light_set_disabled_until_tmw (self, g_value_get_boolean (value));
                 break;
+        case PROP_FORCED:
+                gsd_night_light_set_forced (self, g_value_get_boolean (value));
+                break;
         default:
                 G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
         }
@@ -661,6 +708,9 @@ gsd_night_light_get_property (GObject    *object,
                 break;
         case PROP_DISABLED_UNTIL_TMW:
                 g_value_set_boolean (value, gsd_night_light_get_disabled_until_tmw (self));
+                break;
+        case PROP_FORCED:
+                g_value_set_boolean (value, gsd_night_light_get_forced (self));
                 break;
         default:
                 G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -719,6 +769,14 @@ gsd_night_light_class_init (GsdNightLightClass *klass)
                                          g_param_spec_boolean ("disabled-until-tmw",
                                                                "Disabled until tomorrow",
                                                                "If the night light is disabled until the next day",
+                                                               FALSE,
+                                                               G_PARAM_READWRITE));
+
+        g_object_class_install_property (object_class,
+                                         PROP_FORCED,
+                                         g_param_spec_boolean ("forced",
+                                                               "Forced",
+                                                               "Whether night light should be forced on, useful for previewing",
                                                                FALSE,
                                                                G_PARAM_READWRITE));
 

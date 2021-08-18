@@ -30,6 +30,8 @@ class XsettingsPluginTest(gsdtestcase.GSDTestCase):
     '''Test the xsettings plugin'''
 
     def setUp(self):
+        self.start_logind()
+
         self.daemon_death_expected = False
         self.session_log_write = open(os.path.join(self.workdir, 'gnome-session.log'), 'wb')
         self.session = subprocess.Popen(['gnome-session', '-f',
@@ -56,7 +58,7 @@ class XsettingsPluginTest(gsdtestcase.GSDTestCase):
         self.start_mutter()
 
         Gio.Settings.sync()
-        self.plugin_log_write = open(os.path.join(self.workdir, 'plugin_xsettings.log'), 'wb')
+        self.plugin_log_write = open(os.path.join(self.workdir, 'plugin_xsettings.log'), 'wb', buffering=0)
         os.environ['GSD_ignore_llvmpipe'] = '1'
 
         # Setup fontconfig config path before starting the daemon
@@ -92,7 +94,7 @@ class XsettingsPluginTest(gsdtestcase.GSDTestCase):
             env=env)
 
         # you can use this for reading the current daemon log in tests
-        self.plugin_log = open(self.plugin_log_write.name)
+        self.plugin_log = open(self.plugin_log_write.name, 'rb', buffering=0)
 
         # flush notification log
         try:
@@ -117,6 +119,7 @@ class XsettingsPluginTest(gsdtestcase.GSDTestCase):
 
         self.stop_session()
         self.stop_mutter()
+        self.stop_logind()
 
         # reset all changed gsettings, so that tests are independent from each
         # other
@@ -139,10 +142,37 @@ class XsettingsPluginTest(gsdtestcase.GSDTestCase):
         self.session_log_write.close()
         self.session_log.close()
 
+    def check_plugin_log(self, needle, timeout=0, failmsg=None):
+        '''Check that needle is found in the log within the given timeout.
+        Returns immediately when found.
+
+        Fail after the given timeout.
+        '''
+        if type(needle) == str:
+            needle = needle.encode('ascii')
+        # Fast path if the message was already logged
+        log = self.plugin_log.read()
+        if needle in log:
+            return
+
+        while timeout > 0:
+            time.sleep(0.5)
+            timeout -= 0.5
+
+            # read new data (lines) from the log
+            log = self.plugin_log.read()
+            if needle in log:
+                break
+        else:
+            if failmsg is not None:
+                self.fail(failmsg)
+            else:
+                self.fail('timed out waiting for needle "%s"' % needle)
+
     def test_gtk_modules(self):
         # Turn off event sounds
         self.settings_sound['event-sounds'] = False
-        time.sleep(1)
+        time.sleep(2)
 
         # Verify that only the PackageKit plugin is enabled
         self.assertEqual(self.obj_xsettings_props.Get('org.gtk.Settings', 'Modules'),
@@ -150,81 +180,26 @@ class XsettingsPluginTest(gsdtestcase.GSDTestCase):
 
         # Turn on sounds
         self.settings_sound['event-sounds'] = True
-        time.sleep(1)
+        time.sleep(2)
 
         # Check that both PK and canberra plugin are enabled
         retval = self.obj_xsettings_props.Get('org.gtk.Settings', 'Modules')
         values = sorted(str(retval).split(':'))
-        self.assertEqual(values[0], 'canberra-gtk-module')
-        self.assertEqual(values[1], 'pk-gtk-module')
-
-    def test_enable_animations(self):
-        # Check that "Enable animations" is off
-        self.assertEqual(self.obj_xsettings_props.Get('org.gtk.Settings', 'EnableAnimations'),
-                dbus.Boolean(True, variant_level=1))
-
-        # Make vino appear
-        vino = self.spawn_server('org.gnome.Vino',
-                '/org/gnome/vino/screens/0',
-                'org.gnome.VinoScreen')
-
-        dbus_con = self.get_dbus()
-        obj_vino = dbus_con.get_object('org.gnome.Vino', '/org/gnome/vino/screens/0')
-        mock_vino = dbus.Interface(obj_vino, dbusmock.MOCK_IFACE)
-        mock_vino.AddProperty('', 'Connected', dbus.Boolean(False, variant_level=1))
-
-        time.sleep(0.1)
-
-        # Check animations are still enabled
-        self.assertEqual(self.obj_xsettings_props.Get('org.gtk.Settings', 'EnableAnimations'),
-                dbus.Boolean(True, variant_level=1))
-
-        # Connect a remote user
-        mock_vino.EmitSignal('org.freedesktop.DBus.Properties',
-                             'PropertiesChanged',
-                            'sa{sv}as',
-                            ['org.gnome.VinoScreen',
-                            dbus.Dictionary({'Connected': dbus.Boolean(True, variant_level=1)}, signature='sv'),
-                            dbus.Array([], signature='s')
-                            ])
-
-        time.sleep(0.1)
-
-        # gdbus debug output
-        # gdbus_log_write = open(os.path.join(self.workdir, 'gdbus.log'), 'wb')
-        # process = subprocess.Popen(['gdbus', 'introspect', '--session', '--dest', 'org.gnome.Vino', '--object-path', '/org/gnome/vino/screens/0'],
-        #         stdout=gdbus_log_write, stderr=subprocess.STDOUT)
-        # time.sleep(1)
-
-        # Check that "Enable animations" is off
-        self.assertEqual(self.obj_xsettings_props.Get('org.gtk.Settings', 'EnableAnimations'),
-                dbus.Boolean(False, variant_level=1))
-
-        vino.terminate()
-        vino.wait()
-        time.sleep(0.1)
-
-        # Check animations are back enabled
-        self.assertEqual(self.obj_xsettings_props.Get('org.gtk.Settings', 'EnableAnimations'),
-                dbus.Boolean(True, variant_level=1))
+        self.assertEqual(values, ['canberra-gtk-module', 'pk-gtk-module'])
 
     def test_fontconfig_timestamp(self):
-        # gdbus_log_write = open(os.path.join(self.workdir, 'gdbus.log'), 'wb')
-        # process = subprocess.Popen(['gdbus', 'introspect', '--session', '--dest', 'org.gtk.Settings', '--object-path', '/org/gtk/Settings'],
-        #        stdout=gdbus_log_write, stderr=subprocess.STDOUT)
-        # time.sleep(1)
-
+        # Initially, the value is zero
         before = self.obj_xsettings_props.Get('org.gtk.Settings', 'FontconfigTimestamp')
         self.assertEqual(before, 0)
 
         # Copy the fonts.conf again
         shutil.copy(os.path.join(os.path.dirname(__file__), 'fontconfig-test/fonts.conf'),
                 os.path.join(self.fc_dir, 'fonts.conf'))
-        time.sleep(1)
 
-        # gdbus_log_write = open(os.path.join(self.workdir, 'gdbus-after.log'), 'wb')
-        # process = subprocess.Popen(['gdbus', 'introspect', '--session', '--dest', 'org.gtk.Settings', '--object-path', '/org/gtk/Settings'],
-        #         stdout=gdbus_log_write, stderr=subprocess.STDOUT)
+        # Wait for gsd-xsettings to pick up the change (and process it)
+        self.check_plugin_log("Fontconfig update successful", timeout=5, failmsg="Fontconfig was not updated!")
+
+        # Sleep a bit to ensure that the setting is updated
         time.sleep(1)
 
         after = self.obj_xsettings_props.Get('org.gtk.Settings', 'FontconfigTimestamp')

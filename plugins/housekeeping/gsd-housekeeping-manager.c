@@ -48,7 +48,9 @@ static const gchar introspection_xml[] =
 "  </interface>"
 "</node>";
 
-struct GsdHousekeepingManagerPrivate {
+struct _GsdHousekeepingManager {
+        GObject          parent;
+
         GSettings *settings;
         guint long_term_cb;
         guint short_term_cb;
@@ -58,8 +60,6 @@ struct GsdHousekeepingManagerPrivate {
         GCancellable    *bus_cancellable;
         guint            name_id;
 };
-
-#define GSD_HOUSEKEEPING_MANAGER_GET_PRIVATE(o) (G_TYPE_INSTANCE_GET_PRIVATE ((o), GSD_TYPE_HOUSEKEEPING_MANAGER, GsdHousekeepingManagerPrivate))
 
 static void     gsd_housekeeping_manager_class_init  (GsdHousekeepingManagerClass *klass);
 static void     gsd_housekeeping_manager_init        (GsdHousekeepingManager      *housekeeping_manager);
@@ -78,7 +78,7 @@ typedef struct {
 
 
 typedef struct {
-        time_t  mtime;
+        gint64  time;
         char   *path;
         glong   size;
 } ThumbData;
@@ -100,10 +100,12 @@ read_dir_for_purge (const char *path, GList *files)
 {
         GFile           *read_path;
         GFileEnumerator *enum_dir;
+        int              cannot_get_time = 0;
 
         read_path = g_file_new_for_path (path);
         enum_dir = g_file_enumerate_children (read_path,
                                               G_FILE_ATTRIBUTE_STANDARD_NAME ","
+                                              G_FILE_ATTRIBUTE_TIME_ACCESS ","
                                               G_FILE_ATTRIBUTE_TIME_MODIFIED ","
                                               G_FILE_ATTRIBUTE_STANDARD_SIZE,
                                               G_FILE_QUERY_INFO_NONE,
@@ -120,17 +122,31 @@ read_dir_for_purge (const char *path, GList *files)
                                 ThumbData *td;
                                 GFile     *entry;
                                 char      *entry_path;
-                                GTimeVal   mod_time;
+                                gint64     time;
 
                                 entry = g_file_get_child (read_path, name);
                                 entry_path = g_file_get_path (entry);
                                 g_object_unref (entry);
 
-                                g_file_info_get_modification_time (info, &mod_time);
+                                // If atime is available, it should be no worse than mtime.
+                                // - Even if the file system is mounted with noatime, the atime and
+                                //   mtime will be set to the same value on file creation.
+                                // - Since the thumbnailer never edits thumbnails, and instead swaps
+                                //   in newly created temp files, atime will always be >= mtime.
+
+                                if (g_file_info_has_attribute (info, G_FILE_ATTRIBUTE_TIME_ACCESS)) {
+                                    time = g_file_info_get_attribute_uint64 (info, G_FILE_ATTRIBUTE_TIME_ACCESS);
+                                } else if (g_file_info_has_attribute (info, G_FILE_ATTRIBUTE_TIME_MODIFIED)) {
+                                    time = g_file_info_get_attribute_uint64 (info, G_FILE_ATTRIBUTE_TIME_MODIFIED);
+                                } else {
+                                    // Unlikely to get here, but be defensive
+                                    cannot_get_time += 1;
+                                    time = G_MAXINT64;
+                                }
 
                                 td = g_new0 (ThumbData, 1);
                                 td->path = entry_path;
-                                td->mtime = mod_time.tv_sec;
+                                td->time = time;
                                 td->size = g_file_info_get_size (info);
 
                                 files = g_list_prepend (files, td);
@@ -138,6 +154,10 @@ read_dir_for_purge (const char *path, GList *files)
                         g_object_unref (info);
                 }
                 g_object_unref (enum_dir);
+
+                if (cannot_get_time > 0) {
+                    g_warning ("Could not read atime or mtime on %d files in %s", cannot_get_time, path);
+                }
         }
         g_object_unref (read_path);
 
@@ -147,7 +167,7 @@ read_dir_for_purge (const char *path, GList *files)
 static void
 purge_old_thumbnails (ThumbData *info, PurgeData *purge_data)
 {
-        if ((purge_data->now - info->mtime) > purge_data->max_age) {
+        if ((purge_data->now - info->time) > purge_data->max_age) {
                 g_unlink (info->path);
                 info->size = 0;
         } else {
@@ -156,9 +176,9 @@ purge_old_thumbnails (ThumbData *info, PurgeData *purge_data)
 }
 
 static int
-sort_file_mtime (ThumbData *file1, ThumbData *file2)
+sort_file_time (ThumbData *file1, ThumbData *file2)
 {
-        return file1->mtime - file2->mtime;
+        return file1->time - file2->time;
 }
 
 static char **
@@ -226,8 +246,8 @@ purge_thumbnail_cache (GsdHousekeepingManager *manager)
 
         g_debug ("housekeeping: checking thumbnail cache size and freshness");
 
-        purge_data.max_age = g_settings_get_int (manager->priv->settings, THUMB_AGE_KEY) * 24 * 60 * 60;
-        purge_data.max_size = g_settings_get_int (manager->priv->settings, THUMB_SIZE_KEY) * 1024 * 1024;
+        purge_data.max_age = (glong) g_settings_get_int (manager->settings, THUMB_AGE_KEY) * 24 * 60 * 60;
+        purge_data.max_size = (goffset) g_settings_get_int (manager->settings, THUMB_SIZE_KEY) * 1024 * 1024;
 
         /* if both are set to -1, we don't need to read anything */
         if ((purge_data.max_age < 0) && (purge_data.max_size < 0))
@@ -249,7 +269,7 @@ purge_thumbnail_cache (GsdHousekeepingManager *manager)
 
         if ((purge_data.total_size > purge_data.max_size) && (purge_data.max_size >= 0)) {
                 GList *scan;
-                files = g_list_sort (files, (GCompareFunc) sort_file_mtime);
+                files = g_list_sort (files, (GCompareFunc) sort_file_time);
                 for (scan = files; scan && (purge_data.total_size > purge_data.max_size); scan = scan->next) {
                         ThumbData *info = scan->data;
                         g_unlink (info->path);
@@ -272,19 +292,19 @@ static gboolean
 do_cleanup_once (GsdHousekeepingManager *manager)
 {
         do_cleanup (manager);
-        manager->priv->short_term_cb = 0;
+        manager->short_term_cb = 0;
         return FALSE;
 }
 
 static void
 do_cleanup_soon (GsdHousekeepingManager *manager)
 {
-        if (manager->priv->short_term_cb == 0) {
+        if (manager->short_term_cb == 0) {
                 g_debug ("housekeeping: will tidy up in 2 minutes");
-                manager->priv->short_term_cb = g_timeout_add_seconds (INTERVAL_TWO_MINUTES,
+                manager->short_term_cb = g_timeout_add_seconds (INTERVAL_TWO_MINUTES,
                                                (GSourceFunc) do_cleanup_once,
                                                manager);
-                g_source_set_name_by_id (manager->priv->short_term_cb, "[gnome-settings-daemon] do_cleanup_once");
+                g_source_set_name_by_id (manager->short_term_cb, "[gnome-settings-daemon] do_cleanup_once");
         }
 }
 
@@ -343,9 +363,9 @@ on_bus_gotten (GObject                *source_object,
                 g_error_free (error);
                 return;
         }
-        manager->priv->connection = connection;
+        manager->connection = connection;
 
-        infos = manager->priv->introspection_data->interfaces;
+        infos = manager->introspection_data->interfaces;
         for (i = 0; infos[i] != NULL; i++) {
                 g_dbus_connection_register_object (connection,
                                                    GSD_HOUSEKEEPING_DBUS_PATH,
@@ -356,7 +376,7 @@ on_bus_gotten (GObject                *source_object,
                                                    NULL);
         }
 
-        manager->priv->name_id = g_bus_own_name_on_connection (connection,
+        manager->name_id = g_bus_own_name_on_connection (connection,
                                                                "org.gnome.SettingsDaemon.Housekeeping",
                                                                G_BUS_NAME_OWNER_FLAGS_NONE,
                                                                NULL,
@@ -368,12 +388,12 @@ on_bus_gotten (GObject                *source_object,
 static void
 register_manager_dbus (GsdHousekeepingManager *manager)
 {
-        manager->priv->introspection_data = g_dbus_node_info_new_for_xml (introspection_xml, NULL);
-        g_assert (manager->priv->introspection_data != NULL);
-        manager->priv->bus_cancellable = g_cancellable_new ();
+        manager->introspection_data = g_dbus_node_info_new_for_xml (introspection_xml, NULL);
+        g_assert (manager->introspection_data != NULL);
+        manager->bus_cancellable = g_cancellable_new ();
 
         g_bus_get (G_BUS_TYPE_SESSION,
-                   manager->priv->bus_cancellable,
+                   manager->bus_cancellable,
                    (GAsyncReadyCallback) on_bus_gotten,
                    manager);
 }
@@ -398,18 +418,18 @@ gsd_housekeeping_manager_start (GsdHousekeepingManager *manager,
 
         gsd_ldsm_setup (FALSE);
 
-        manager->priv->settings = g_settings_new (THUMB_PREFIX);
-        g_signal_connect (G_OBJECT (manager->priv->settings), "changed",
+        manager->settings = g_settings_new (THUMB_PREFIX);
+        g_signal_connect (G_OBJECT (manager->settings), "changed",
                           G_CALLBACK (settings_changed_callback), manager);
 
         /* Clean once, a few minutes after start-up */
         do_cleanup_soon (manager);
 
         /* Clean periodically, on a daily basis. */
-        manager->priv->long_term_cb = g_timeout_add_seconds (INTERVAL_ONCE_A_DAY,
+        manager->long_term_cb = g_timeout_add_seconds (INTERVAL_ONCE_A_DAY,
                                       (GSourceFunc) do_cleanup,
                                       manager);
-        g_source_set_name_by_id (manager->priv->long_term_cb, "[gnome-settings-daemon] do_cleanup");
+        g_source_set_name_by_id (manager->long_term_cb, "[gnome-settings-daemon] do_cleanup");
 
         gnome_settings_profile_end (NULL);
 
@@ -419,38 +439,36 @@ gsd_housekeeping_manager_start (GsdHousekeepingManager *manager,
 void
 gsd_housekeeping_manager_stop (GsdHousekeepingManager *manager)
 {
-        GsdHousekeepingManagerPrivate *p = manager->priv;
-
         g_debug ("Stopping housekeeping manager");
 
-        if (manager->priv->name_id != 0) {
-                g_bus_unown_name (manager->priv->name_id);
-                manager->priv->name_id = 0;
+        if (manager->name_id != 0) {
+                g_bus_unown_name (manager->name_id);
+                manager->name_id = 0;
         }
 
-        g_clear_object (&p->bus_cancellable);
-        g_clear_pointer (&p->introspection_data, g_dbus_node_info_unref);
-        g_clear_object (&p->connection);
+        g_clear_object (&manager->bus_cancellable);
+        g_clear_pointer (&manager->introspection_data, g_dbus_node_info_unref);
+        g_clear_object (&manager->connection);
 
-        if (p->short_term_cb) {
-                g_source_remove (p->short_term_cb);
-                p->short_term_cb = 0;
+        if (manager->short_term_cb) {
+                g_source_remove (manager->short_term_cb);
+                manager->short_term_cb = 0;
         }
 
-        if (p->long_term_cb) {
-                g_source_remove (p->long_term_cb);
-                p->long_term_cb = 0;
+        if (manager->long_term_cb) {
+                g_source_remove (manager->long_term_cb);
+                manager->long_term_cb = 0;
 
                 /* Do a clean-up on shutdown if and only if the size or age
                    limits have been set to paranoid levels (zero) */
-                if ((g_settings_get_int (p->settings, THUMB_AGE_KEY) == 0) ||
-                    (g_settings_get_int (p->settings, THUMB_SIZE_KEY) == 0)) {
+                if ((g_settings_get_int (manager->settings, THUMB_AGE_KEY) == 0) ||
+                    (g_settings_get_int (manager->settings, THUMB_SIZE_KEY) == 0)) {
                         do_cleanup (manager);
                 }
 
         }
 
-        g_clear_object (&p->settings);
+        g_clear_object (&manager->settings);
         gsd_ldsm_clean ();
 }
 
@@ -470,14 +488,11 @@ gsd_housekeeping_manager_class_init (GsdHousekeepingManagerClass *klass)
         object_class->finalize = gsd_housekeeping_manager_finalize;
 
         notify_init ("gnome-settings-daemon");
-
-        g_type_class_add_private (klass, sizeof (GsdHousekeepingManagerPrivate));
 }
 
 static void
 gsd_housekeeping_manager_init (GsdHousekeepingManager *manager)
 {
-        manager->priv = GSD_HOUSEKEEPING_MANAGER_GET_PRIVATE (manager);
 }
 
 GsdHousekeepingManager *

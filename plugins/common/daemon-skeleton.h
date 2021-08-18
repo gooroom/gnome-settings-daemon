@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <locale.h>
 
+#include <glib-unix.h>
 #include <glib/gi18n.h>
 
 #include "gnome-settings-bus.h"
@@ -22,6 +23,10 @@
 #ifndef PLUGIN_NAME
 #error Include PLUGIN_CFLAGS in the daemon s CFLAGS
 #endif /* !PLUGIN_NAME */
+
+#ifndef PLUGIN_DBUS_NAME
+#error Include PLUGIN_DBUS_NAME in the daemon s CFLAGS
+#endif /* !PLUGIN_DBUS_NAME */
 
 #define GNOME_SESSION_DBUS_NAME                     "org.gnome.SessionManager"
 #define GNOME_SESSION_CLIENT_PRIVATE_DBUS_INTERFACE "org.gnome.SessionManager.ClientPrivate"
@@ -37,36 +42,6 @@ static GOptionEntry entries[] = {
         { "verbose", 'v', 0, G_OPTION_ARG_NONE, &verbose, "Verbose", NULL },
         {NULL}
 };
-
-static const char *gdm_helpers[] = {
-	"a11y-keyboard",
-	"a11y-settings",
-	"clipboard",
-	"color",
-	"keyboard",
-	"media-keys",
-	"power",
-	"smartcard",
-	"sound",
-	"xsettings"
-};
-
-static gboolean
-should_run (void)
-{
-	const char *session_mode;
-	guint i;
-
-	session_mode = g_getenv ("GNOME_SHELL_SESSION_MODE");
-	if (g_strcmp0 (session_mode, "gdm") != 0)
-		return TRUE;
-
-	for (i = 0; i < G_N_ELEMENTS (gdm_helpers); i++) {
-		if (g_str_equal (PLUGIN_NAME, gdm_helpers[i]))
-			return TRUE;
-	}
-	return FALSE;
-}
 
 static void
 respond_to_end_session (GDBusProxy *proxy)
@@ -160,6 +135,59 @@ register_with_gnome_session (GMainLoop *loop)
 			   NULL,
 			   (GAsyncReadyCallback) on_client_registered,
 			   loop);
+
+	/* DESKTOP_AUTOSTART_ID must not leak into child processes, because
+	 * it can't be reused. Child processes will not know whether this is
+	 * a genuine value or erroneous already-used value. */
+	g_unsetenv ("DESKTOP_AUTOSTART_ID");
+}
+
+static gboolean
+handle_sigterm (gpointer user_data)
+{
+  GMainLoop *main_loop = user_data;
+
+  g_debug ("Got SIGTERM; shutting down ...");
+
+  if (g_main_loop_is_running (main_loop))
+    g_main_loop_quit (main_loop);
+
+  return G_SOURCE_REMOVE;
+}
+
+static void
+install_signal_handler (GMainLoop *loop)
+{
+  g_autoptr(GSource) source = NULL;
+
+  source = g_unix_signal_source_new (SIGTERM);
+
+  g_source_set_callback (source, handle_sigterm, loop, NULL);
+  g_source_attach (source, NULL);
+}
+
+static void
+bus_acquired_cb (GDBusConnection *connection,
+                 const gchar *name,
+                 gpointer user_data G_GNUC_UNUSED)
+{
+        g_debug ("%s: acquired bus %p for name %s", G_STRFUNC, connection, name);
+}
+
+static void
+name_acquired_cb (GDBusConnection *connection,
+                  const gchar *name,
+                  gpointer user_data G_GNUC_UNUSED)
+{
+        g_debug ("%s: acquired name %s on bus %p", G_STRFUNC, name, connection);
+}
+
+static void
+name_lost_cb (GDBusConnection *connection,
+              const gchar *name,
+              gpointer user_data G_GNUC_UNUSED)
+{
+        g_debug ("%s: lost name %s on bus %p", G_STRFUNC, name, connection);
 }
 
 int
@@ -168,6 +196,7 @@ main (int argc, char **argv)
         GError *error = NULL;
         GOptionContext *context;
         GMainLoop *loop;
+        guint name_own_id;
 
         bindtextdomain (GETTEXT_PACKAGE, GNOME_SETTINGS_LOCALEDIR);
         bind_textdomain_codeset (GETTEXT_PACKAGE, "UTF-8");
@@ -204,23 +233,32 @@ main (int argc, char **argv)
 		g_source_set_name_by_id (id, "[gnome-settings-daemon] g_main_loop_quit");
 	}
 
+        install_signal_handler (loop);
+
         manager = NEW ();
 	register_with_gnome_session (loop);
 
-	if (should_run ()) {
-		error = NULL;
-		if (!START (manager, &error)) {
-			fprintf (stderr, "Failed to start: %s\n", error->message);
-			g_error_free (error);
-			exit (1);
-		}
-	}
+        if (!START (manager, &error)) {
+                fprintf (stderr, "Failed to start: %s\n", error->message);
+                g_error_free (error);
+                exit (1);
+        }
+
+	name_own_id = g_bus_own_name (G_BUS_TYPE_SESSION,
+				      PLUGIN_DBUS_NAME,
+				      G_BUS_NAME_OWNER_FLAGS_DO_NOT_QUEUE,
+				      bus_acquired_cb,
+				      name_acquired_cb,
+				      name_lost_cb,
+				      NULL, /* user_data */
+				      NULL /* user_data_free_func */);
 
         g_main_loop_run (loop);
 
-	if (should_run ())
-		STOP (manager);
+        STOP (manager);
+
         g_object_unref (manager);
+        g_bus_unown_name (name_own_id);
 
         return 0;
 }

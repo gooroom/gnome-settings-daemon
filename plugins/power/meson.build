@@ -1,6 +1,6 @@
 sources = files(
   'gpm-common.c',
-  'gsd-backlight-linux.c',
+  'gsd-backlight.c',
   'gsd-power-manager.c',
   'main.c'
 )
@@ -14,11 +14,17 @@ deps = plugins_deps + [
   m_dep,
   upower_glib_dep,
   x11_dep,
-  xtst_dep,
   dependency('xext')
 ]
 
-if enable_gudev
+# required for gsd-power-enums-update, which we have
+# to compile natively
+native_deps = [
+  dependency('glib-2.0', native: true),
+  dependency('gio-2.0', native:true)
+]
+
+if host_is_linux
   deps += gudev_dep
 endif
 
@@ -55,11 +61,12 @@ gsd_power_enums_update = executable(
   'gsd-power-enums-update',
   sources,
   include_directories: top_inc,
-  dependencies: deps,
-  c_args: cflags
+  dependencies: native_deps,
+  c_args: cflags,
+  native: true
 )
 
-if enable_gudev
+if host_is_linux
   policy = 'org.gnome.settings-daemon.plugins.power.policy'
 
   policy_in = configure_file(
@@ -79,12 +86,9 @@ if enable_gudev
 
   sources = files(
     'gsd-backlight-helper.c',
-    'gsd-backlight-linux.c'
   )
 
   deps = [
-    gudev_dep,
-    m_dep
   ]
 
   executable(
@@ -120,18 +124,27 @@ gsdpowerenums_py = custom_target(
 
 test_py = find_program('test.py')
 
-envs = [
-#  'G_DEBUG=fatal_warnings',
-  'BUILDDIR=' + meson.current_build_dir(),
-  'TOP_BUILDDIR=' + meson.build_root(),
-  'USE_SUSPEND_THEN_HIBERNATE=' + (use_suspend_then_hibernate ? '1' : '0'),
-]
+envs = environment()
+#envs.prepend('G_DEBUG', 'fatal-warnings')
+envs.set('BUILDDIR', meson.current_build_dir())
+envs.set('TOP_BUILDDIR', meson.build_root())
+envs.set('LD_PRELOAD', 'libumockdev-preload.so.0')
+envs.set('NO_AT_BRIDGE', '1')
+envs.set('HAVE_SYSFS_BACKLIGHT', host_is_linux ? '1' : '0')
 
-test(
-  'test-power',
-  test_py,
-#  args: 'PowerPluginTest.test_sleep_inactive_blank',
-  env: envs,
-  timeout: 500
-)
+if get_option('b_sanitize').split(',').contains('address')
+  # libasan needs to be loaded first; so we need to explicitly preload it
+  envs.set('POWER_LD_PRELOAD', 'libasan.so.5')
+endif
+
+foreach i : [ 1, 2, 3, 4, 5, 6, 7, 8 ]
+  test(
+    'test-power @0@/8'.format(i),
+    test_py,
+    args: [ 'PowerPluginTest@0@'.format(i) ],
+    env: envs,
+    # The first set of tests takes very long because of SCREENSAVER_TIMEOUT_BLANK
+    timeout: i == 1 ? 180 : 120
+  )
+endforeach
 
