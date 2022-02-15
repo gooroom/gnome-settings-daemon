@@ -3,3 +3,4 @@ debian/meson.build-Lower-polkit-requirement.patch
 gooroom-modify-media-key-shortcut.patch
 gooroom-execute-suspend-and-DPMS-action-after-running-screensaver.patch
 gooroom-shorten-purge-trash-adapting-time.patch
+gooroom-added-signal-to-get-purge-infos-changes.patch
