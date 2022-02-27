@@ -1,3 +1,13 @@
+gnome-settings-daemon (3.38.2-1+grm3u1) unstable; urgency=medium
+
+  [ heejun.jang ]
+  * [4a19f5ed] [Bug:2413]Modify media-key shortcut for Gooroom
+  * [a4e10d66] DPMS를 끄거나 혹은 잠자기(suspend)모드 작동 시 스크린세이버가 연관되어 있으면 스크린세이버의 실행 이후에 작동 되도록 수정
+  * [e8ac198d] [Bug:3359]Shorten purge trash id adapting time
+  * [291346e8] Added signal to get purge related infos changes
+
+ -- Gooroom Autobuilder <jenkins@gooroom.kr>  Sun, 27 Feb 2022 14:59:27 +0900
+
 gnome-settings-daemon (3.38.2-1) unstable; urgency=medium
 
   * Team upload
